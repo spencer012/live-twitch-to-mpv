@@ -1,0 +1,93 @@
+# streamlink-rust example configuration
+#
+# Copy this file to "config.toml" next to the executable (or pass a path via
+# --config). All settings are optional; the values shown here mirror a typical
+# low-latency Twitch setup. Defaults are noted in the comments.
+
+[twitch]
+# Enable low-latency streaming (prefetch segments, live edge clamped to 1-2).
+low_latency = true
+
+# Codec preference signalled to Twitch. Default: ["h264"]
+supported_codecs = ["av1", "h265", "h264"]
+
+# Enable the delayed-playback ad-block system (with backup player-type
+# fallback for pre-roll ads). Default: false
+ad_block = true
+
+# Extra headers sent with every Twitch API request. Adding your account's
+# OAuth token can prevent ads (Turbo/subscriptions).
+# NOTE: replace the placeholder with your own token; never commit it anywhere.
+[twitch.api_headers]
+Authorization = "OAuth <YOUR_TWITCH_OAUTH_TOKEN>"
+
+[player]
+# Player executable, searched in PATH. Default: "mpv"
+command = "mpv"
+
+# Raw argument string passed to the player (quotes are respected).
+args = "--profile='low-latency-stream' --keep-open=always --loop=no"
+
+# Don't kill the player when the stream ends; stdin is closed and mpv's
+# --keep-open takes over. Default: false
+no_close = true
+
+# Pass the channel login to mpv via
+# --script-opts-append=mpv_twitch_report-channel=<channel>. Default: false
+include_channel_name = true
+
+# Show player output instead of discarding it. Default: false
+verbose = false
+
+[stream]
+# Output buffer size in MiB. Default: 16
+ring_buffer_mb = 128
+
+# Segments back from the live edge to start at (low latency clamps to 1-2).
+# Default: 3
+live_edge = 1
+
+# Start at the beginning of the available playlist instead of the live edge.
+# Default: false
+live_restart = true
+
+# Keep the stream open when it drops and poll for recovery. Default: false
+persist_stream = true
+
+# Max seconds to wait for stream recovery (0 = forever). Default: 600
+recovery_timeout = 600
+
+# Download attempts per segment. Default: 3
+segment_attempts = 10
+
+# Parallel segment downloads. Default: 1
+segment_threads = 2
+
+# Per-segment request timeout in seconds. Default: 10
+segment_timeout = 30
+
+# Overall stream read timeout in seconds. Default: 60
+stream_timeout = 600
+
+[retry]
+# Seconds between stream availability polls (0 = don't poll). Default: 0
+streams = 1
+
+# Max availability polls (0 = infinite). Default: 0
+max = 600
+
+# Attempts to open the selected stream. Default: 1
+open = 60
+
+[quality]
+# Quality names tried in order; "best" and "worst" are supported.
+# "1080p60" also matches "1080p60 (source)". Default: ["best"]
+priority = ["1080p60", "1080p", "720p60", "720p", "480p", "360p"]
+
+# Prefer this priority list over a quality given on the command line.
+# Default: false
+prefer_config = false
+
+[log]
+# trace | debug | info | warn | error. Default: "info"
+level = "info"
