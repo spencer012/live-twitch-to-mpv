@@ -1,7 +1,8 @@
-# streamlink-rust
+# TwitchPipe
 
-A standalone Rust CLI that plays Twitch live streams through mpv. It is a
-focused port of a custom streamlink fork: low-latency HLS pipeline,
+TwitchPipe is a standalone Rust CLI that pipes live Twitch streams into mpv.
+It is inspired by the Twitch and HLS parts of Streamlink, but it is a focused
+player rather than a Streamlink-compatible clone: low-latency HLS,
 persist/recovery for dropped streams, and a segmented ad-block system
 (delayed playback for mid-rolls, backup player types for pre-rolls).
 
@@ -13,11 +14,11 @@ Live streams only — no VODs, no clips, and no client-integrity browser flow
 Requires a recent stable Rust toolchain.
 
 ```powershell
-cd streamlink-rust
+cd live-twitch-to-mpv
 cargo build --release
 ```
 
-The binary ends up at `target\release\streamlink-rust.exe`.
+The binary ends up at `target\release\twitchpipe.exe`.
 
 For development checks:
 
@@ -54,17 +55,17 @@ Key sections:
 
 ```powershell
 # channel name or twitch.tv URL; quality is optional (falls back to [quality].priority)
-streamlink-rust some_channel
-streamlink-rust https://twitch.tv/some_channel 720p60
+twitchpipe some_channel
+twitchpipe https://twitch.tv/some_channel 720p60
 
 # custom config path
-streamlink-rust --config .\config.toml some_channel
+twitchpipe --config .\config.toml some_channel
 
 # verify token/usher/playlist fetching + parsing without launching a player
-streamlink-rust --check some_channel
+twitchpipe --check some_channel
 
 # override the log level
-streamlink-rust --log-level debug some_channel
+twitchpipe --log-level debug some_channel
 ```
 
 ## How it works

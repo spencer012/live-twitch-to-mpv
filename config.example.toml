@@ -1,4 +1,4 @@
-# streamlink-rust example configuration
+# TwitchPipe example configuration
 #
 # Copy this file to "config.toml" next to the executable (or pass a path via
 # --config). All settings are optional; the values shown here mirror a typical

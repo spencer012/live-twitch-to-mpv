@@ -1,9 +1,9 @@
 [package]
-name = "streamlink-rust"
+name = "twitchpipe"
 version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
-description = "Focused Twitch live-stream player inspired by a custom Streamlink fork"
+description = "Low-latency Twitch live streams piped to mpv"
 
 [dependencies]
 anyhow = "1.0.103"

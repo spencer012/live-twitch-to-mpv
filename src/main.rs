@@ -30,7 +30,7 @@ const PREBUFFER_SIZE: usize = 8192;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "streamlink-rust",
+    name = "twitchpipe",
     about = "Standalone Twitch live stream player pipeline (mpv output)",
     version
 )]
@@ -130,7 +130,7 @@ async fn resolve_stream(
             // No client-integrity browser flow in this port: report clearly.
             bail!(
                 "Twitch API error while fetching the access token: {message}\n\
-                 (client-integrity token acquisition is not supported by streamlink-rust)"
+                 (client-integrity token acquisition is not supported by TwitchPipe)"
             );
         }
     };
