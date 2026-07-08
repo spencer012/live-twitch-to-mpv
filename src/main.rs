@@ -102,6 +102,13 @@ fn build_http_client() -> Result<reqwest::Client> {
              Chrome/136.0.0.0 Safari/537.36",
         )
         .default_headers(headers)
+        // HTTP/1.1 only, like streamlink (requests/urllib3). Over HTTP/2 all
+        // requests share one connection, and segment responses that are held
+        // with unread bodies (for ordered write-out) consume the connection's
+        // flow-control window, stalling the actively-drained segment stream
+        // and playlist reloads. HTTP/1.1 gives each in-flight segment its own
+        // connection instead.
+        .http1_only()
         .build()
         .context("failed to build HTTP client")
 }
