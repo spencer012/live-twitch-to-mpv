@@ -64,6 +64,14 @@ pub struct TwitchApi {
 
 impl TwitchApi {
     pub fn new(client: reqwest::Client, extra_headers: &BTreeMap<String, String>) -> Result<Self> {
+        Self::new_with_auth(client, extra_headers, None)
+    }
+
+    pub fn new_with_auth(
+        client: reqwest::Client,
+        extra_headers: &BTreeMap<String, String>,
+        auth_token: Option<&str>,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert("Client-ID", HeaderValue::from_static(CLIENT_ID));
         for (key, value) in extra_headers {
@@ -73,6 +81,12 @@ impl TwitchApi {
             let value = HeaderValue::from_str(value)
                 .with_context(|| format!("invalid API header value for {key}"))?;
             headers.insert(name, value);
+        }
+        if let Some(token) = auth_token.map(str::trim).filter(|token| !token.is_empty()) {
+            let mut value = HeaderValue::from_str(&format!("OAuth {token}"))
+                .context("invalid Twitch auth token")?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
         }
         Ok(Self { client, headers })
     }
@@ -369,5 +383,21 @@ mod tests {
         assert_eq!(vods[0].id, "1234");
         assert_eq!(vods[0].recorded_at_unix_ms, 1_767_225_600_000);
         assert_eq!(vods[0].duration_sec, 90.0);
+    }
+
+    #[test]
+    fn auth_token_adds_sensitive_oauth_header() {
+        let api =
+            TwitchApi::new_with_auth(reqwest::Client::new(), &BTreeMap::new(), Some("test-token"))
+                .unwrap();
+        let value = api.headers.get(reqwest::header::AUTHORIZATION).unwrap();
+        assert_eq!(value, "OAuth test-token");
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn absent_auth_token_keeps_anonymous_headers() {
+        let api = TwitchApi::new_with_auth(reqwest::Client::new(), &BTreeMap::new(), None).unwrap();
+        assert!(!api.headers.contains_key(reqwest::header::AUTHORIZATION));
     }
 }

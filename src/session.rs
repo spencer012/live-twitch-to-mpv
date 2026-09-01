@@ -28,12 +28,14 @@ use crate::timeline::{DEFAULT_BUFFER_CAP_BYTES, SegmentSource, StagedSegment, Ti
 use crate::twitch::api::{TokenResult, TwitchApi, VodInfo};
 use crate::twitch::usher::{PLAYER_REFERER, UsherService};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionConfig {
     pub channel: String,
     #[serde(default = "default_quality")]
     pub quality: String,
+    #[serde(default)]
+    pub auth_token: Option<String>,
     pub buffer_dir: String,
     #[serde(default = "default_buffer_cap")]
     pub buffer_cap_bytes: u64,
@@ -345,7 +347,11 @@ async fn run_engine(
     cancel: CancellationToken,
 ) -> Result<()> {
     let client = build_http_client()?;
-    let api = TwitchApi::new(client.clone(), &BTreeMap::new())?;
+    let api = TwitchApi::new_with_auth(
+        client.clone(),
+        &BTreeMap::new(),
+        config.auth_token.as_deref(),
+    )?;
     let usher = UsherService::new(&["h264".to_string()]);
     let metadata = api.metadata_channel(&config.channel).await.ok();
     let stream_started_ms = metadata
@@ -870,6 +876,20 @@ fn normalize_channel(input: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_config_accepts_optional_auth_token() {
+        let with_token: SessionConfig = serde_json::from_str(
+            r#"{"channel":"example","bufferDir":"cache","authToken":"test-token"}"#,
+        )
+        .unwrap();
+        assert_eq!(with_token.auth_token.as_deref(), Some("test-token"));
+
+        let anonymous: SessionConfig =
+            serde_json::from_str(r#"{"channel":"example","bufferDir":"cache","authToken":null}"#)
+                .unwrap();
+        assert!(anonymous.auth_token.is_none());
+    }
 
     #[test]
     fn maps_only_outage_window_to_vod() {

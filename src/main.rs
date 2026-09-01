@@ -22,7 +22,7 @@ use crate::twitch::usher::{PLAYER_REFERER, UsherService};
 
 const PREBUFFER_SIZE: usize = 8192;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "twitchpipe",
     about = "Standalone Twitch live stream player pipeline (mpv output)",
@@ -38,6 +38,10 @@ struct Cli {
     /// Path to the TOML config file
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Twitch auth-token cookie value (or set TWITCH_AUTH_TOKEN)
+    #[arg(long, env = "TWITCH_AUTH_TOKEN", value_name = "TOKEN")]
+    auth_token: Option<String>,
 
     /// Verify token/usher/playlist fetching and parsing, then exit
     /// without launching the player
@@ -565,6 +569,7 @@ pub async fn run() -> Result<()> {
                     .cloned()
                     .unwrap_or("best".into())
             }),
+            auth_token: cli.auth_token.clone(),
             buffer_dir: buffer_dir.to_string_lossy().into_owned(),
             buffer_cap_bytes: cli.buffer_cap_bytes,
             adblock: AdblockConfig {
@@ -597,7 +602,11 @@ pub async fn run() -> Result<()> {
     }
 
     let client = build_http_client(&config)?;
-    let api = TwitchApi::new(client.clone(), &config.twitch.api_headers)?;
+    let api = TwitchApi::new_with_auth(
+        client.clone(),
+        &config.twitch.api_headers,
+        cli.auth_token.as_deref(),
+    )?;
     let usher = UsherService::new(&config.twitch.supported_codecs);
 
     if cli.streams {
