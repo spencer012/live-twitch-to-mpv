@@ -64,6 +64,9 @@ twitchpipe --config .\config.toml some_channel
 # verify token/usher/playlist fetching + parsing without launching a player
 twitchpipe --check some_channel
 
+# list available stream qualities, one per line, without launching a player
+twitchpipe --streams some_channel
+
 # override the log level
 twitchpipe --log-level debug some_channel
 ```
