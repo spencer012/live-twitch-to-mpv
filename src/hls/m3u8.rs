@@ -320,14 +320,7 @@ impl TwitchM3U8Parser {
         // Twitch sometimes incorrectly inserts discontinuity tags between
         // segments of the live content: clear them when neither the current
         // nor the previous segment is an ad.
-        if discontinuity
-            && !ad
-            && self
-                .playlist
-                .segments
-                .last()
-                .is_some_and(|last| !last.ad)
-        {
+        if discontinuity && !ad && self.playlist.segments.last().is_some_and(|last| !last.ad) {
             discontinuity = false;
         }
 
@@ -486,7 +479,10 @@ mod tests {
         assert_eq!(playlist.segments.len(), 2);
         assert_eq!(playlist.segments[0].num, 100);
         assert_eq!(playlist.segments[1].num, 101);
-        assert_eq!(playlist.segments[0].uri, "https://example.com/hls/seg100.ts");
+        assert_eq!(
+            playlist.segments[0].uri,
+            "https://example.com/hls/seg100.ts"
+        );
         assert_eq!(playlist.segments[0].title.as_deref(), Some("live"));
         assert!(!playlist.segments[0].ad);
         assert!(!playlist.is_endlist);
@@ -601,7 +597,10 @@ mod tests {
         let p1 = &playlist.segments[1];
         let p2 = &playlist.segments[2];
         assert!(p1.ad, "prefetch after discontinuity must be flagged as ad");
-        assert!(p2.ad, "discontinuity state persists across prefetch segments");
+        assert!(
+            p2.ad,
+            "discontinuity state persists across prefetch segments"
+        );
         // ad transition sets the prefetch segment's discontinuity flag
         assert!(p1.discontinuity);
         assert!(!p2.discontinuity);
@@ -618,7 +617,10 @@ mod tests {
              #EXT-X-TWITCH-PREFETCH:prefetch31.ts\n",
         );
         let p = &playlist.segments[1];
-        assert!(p.ad, "prefetch whose extrapolated date is in an ad daterange");
+        assert!(
+            p.ad,
+            "prefetch whose extrapolated date is in an ad daterange"
+        );
     }
 
     #[test]
@@ -681,10 +683,50 @@ mod tests {
     }
 
     #[test]
-    fn endlist_detected() {
+    fn map_uri_attached_to_segments_and_inherited_by_prefetch() {
+        // fMP4/CMAF playlists declare an EXT-X-MAP initialization segment;
+        // every segment must carry it so the fetcher can emit it first.
         let playlist = seg_playlist(
-            "#EXTINF:2.000,live\nseg.ts\n#EXT-X-ENDLIST\n",
+            "#EXT-X-MEDIA-SEQUENCE:10\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00.000Z\n\
+             #EXTINF:2.000,live\n\
+             seg10.mp4\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:02.000Z\n\
+             #EXTINF:2.000,live\n\
+             seg11.mp4\n\
+             #EXT-X-TWITCH-PREFETCH:prefetch12.mp4\n",
         );
+        assert_eq!(playlist.segments.len(), 3);
+        for segment in &playlist.segments {
+            assert_eq!(
+                segment.map_uri.as_deref(),
+                Some("https://example.com/hls/init.mp4"),
+                "segment {} (prefetch={}) must carry the map URI",
+                segment.num,
+                segment.prefetch
+            );
+        }
+    }
+
+    #[test]
+    fn map_uri_cleared_by_discontinuity() {
+        let playlist = seg_playlist(
+            "#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:2.000,live\n\
+             seg0.mp4\n\
+             #EXT-X-DISCONTINUITY\n\
+             #EXTINF:2.000,live\n\
+             seg1.ts\n",
+        );
+        assert!(playlist.segments[0].map_uri.is_some());
+        assert!(playlist.segments[1].map_uri.is_none());
+    }
+
+    #[test]
+    fn endlist_detected() {
+        let playlist = seg_playlist("#EXTINF:2.000,live\nseg.ts\n#EXT-X-ENDLIST\n");
         assert!(playlist.is_endlist);
     }
 

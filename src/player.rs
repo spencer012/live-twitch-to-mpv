@@ -55,11 +55,7 @@ pub fn split_args(input: &str) -> Vec<String> {
 /// - `--force-media-title=<title>` (mpv window title)
 /// - `--script-opts-append=mpv_twitch_report-channel=<channel>` when
 ///   `include_channel_name` is enabled (the fork's mechanism)
-pub fn build_player_args(
-    config: &PlayerConfig,
-    channel: &str,
-    title: Option<&str>,
-) -> Vec<String> {
+pub fn build_player_args(config: &PlayerConfig, channel: &str, title: Option<&str>) -> Vec<String> {
     let mut args = Vec::new();
 
     let media_title = title.filter(|t| !t.is_empty()).unwrap_or(channel);
@@ -147,7 +143,9 @@ mod tests {
     #[test]
     fn splits_quoted_args() {
         assert_eq!(
-            split_args("--profile='low-latency-stream,stream-start-enabled-catchup' --keep-open=always"),
+            split_args(
+                "--profile='low-latency-stream,stream-start-enabled-catchup' --keep-open=always"
+            ),
             vec![
                 "--profile=low-latency-stream,stream-start-enabled-catchup",
                 "--keep-open=always"

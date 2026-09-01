@@ -20,6 +20,17 @@ const RELOAD_TIME_DEFAULT: f64 = 6.0;
 const RECOVERY_RETRY_INTERVAL: f64 = 10.0;
 const QUEUE_DEADLINE_FACTOR: f64 = 3.0;
 const QUEUE_DEADLINE_MIN: f64 = 5.0;
+/// Unproductive recovery polls (errors or empty reloads) before trying to
+/// re-resolve a fresh playlist URL.
+const RECOVERY_STALE_POLLS: u32 = 3;
+
+/// Re-resolves the media playlist URL (fresh token -> usher -> variant).
+/// Used during recovery: after a stream drop/restart the old usher URL is
+/// dead and reloading it can never succeed.
+#[async_trait::async_trait]
+pub trait StreamUrlResolver: Send + Sync {
+    async fn resolve(&self) -> Option<String>;
+}
 
 pub struct WorkerConfig {
     pub low_latency: bool,
@@ -57,6 +68,7 @@ pub struct PlaylistWorker {
     hook: Arc<Mutex<dyn SegmentHook>>,
     tx: mpsc::Sender<MediaSegment>,
     recovery: RecoveryRequest,
+    resolver: Arc<dyn StreamUrlResolver>,
 
     sequence: i64,
     targetduration: f64,
@@ -77,6 +89,7 @@ impl PlaylistWorker {
         hook: Arc<Mutex<dyn SegmentHook>>,
         tx: mpsc::Sender<MediaSegment>,
         recovery: RecoveryRequest,
+        resolver: Arc<dyn StreamUrlResolver>,
     ) -> Self {
         Self {
             client,
@@ -85,6 +98,7 @@ impl PlaylistWorker {
             hook,
             tx,
             recovery,
+            resolver,
             sequence: -1,
             targetduration: 0.0,
             reload_time: RELOAD_TIME_DEFAULT,
@@ -174,7 +188,11 @@ impl PlaylistWorker {
         // Reload time: last segment duration in LL mode, else targetduration,
         // else keep the current value; halve (floor 1s) when unchanged.
         let new_reload_time = if self.config.low_latency {
-            playlist.segments.last().map(|s| s.duration).filter(|d| *d > 0.0)
+            playlist
+                .segments
+                .last()
+                .map(|s| s.duration)
+                .filter(|d| *d > 0.0)
         } else {
             None
         }
@@ -221,11 +239,14 @@ impl PlaylistWorker {
     }
 
     /// Poll the playlist until segments at/after the current sequence appear,
-    /// every 10s, up to recovery_timeout (0 = forever).
+    /// every 10s, up to recovery_timeout (0 = forever). After several
+    /// unproductive polls, re-resolve the playlist URL: a stream that dropped
+    /// and restarted gets a new usher URL and the old one never recovers.
     async fn recover_stream(&mut self) -> bool {
         tracing::info!("[persist] Stream appears offline, waiting for recovery...");
         let started = Instant::now();
         let mut attempt = 0u64;
+        let mut stale_polls = 0u32;
 
         loop {
             if self.config.recovery_timeout > 0.0 {
@@ -258,9 +279,27 @@ impl PlaylistWorker {
                         return true;
                     }
                     tracing::debug!("[persist] No new segments yet, continuing to wait...");
+                    stale_polls += 1;
                 }
                 Err(err) => {
                     tracing::debug!("[persist] Playlist reload failed: {err:#}");
+                    stale_polls += 1;
+                }
+            }
+
+            if stale_polls >= RECOVERY_STALE_POLLS {
+                stale_polls = 0;
+                tracing::debug!("[persist] Attempting to re-resolve the stream URL...");
+                if let Some(url) = self.resolver.resolve().await {
+                    tracing::info!("[persist] Re-resolved stream URL, restarting at the live edge");
+                    self.url = url;
+                    // New URL means a (possibly) new broadcast with fresh
+                    // sequence numbering: redo initial positioning.
+                    self.sequence = -1;
+                    self.playlist_end = None;
+                    self.last_segment_nums.clear();
+                } else {
+                    tracing::debug!("[persist] Re-resolve failed (channel still offline?)");
                 }
             }
         }

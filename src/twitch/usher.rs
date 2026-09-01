@@ -64,6 +64,38 @@ impl UsherService {
 
         url
     }
+
+    /// Twitch still serves this older path in regions where the v2 route
+    /// returns 404. Keep it as a fallback so the primary URL stays unchanged.
+    pub fn legacy_channel_url(
+        &self,
+        channel: &str,
+        token: &AccessToken,
+        strip_parent_domains: bool,
+    ) -> Url {
+        let mut url = self.channel_url(channel, token, strip_parent_domains);
+        url.set_path(&format!("/api/channel/hls/{}.m3u8", channel.to_lowercase()));
+        url
+    }
+
+    pub fn vod_url(&self, vod_id: &str, token: &AccessToken) -> Url {
+        let mut url = Url::parse(&format!("https://usher.ttvnw.net/vod/{vod_id}.m3u8"))
+            .expect("static VOD usher URL is valid");
+        let p = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0)
+            % 1_000_000;
+        url.query_pairs_mut()
+            .append_pair("allow_source", "true")
+            .append_pair("allow_audio_only", "true")
+            .append_pair("playlist_include_framerate", "true")
+            .append_pair("supported_codecs", &self.supported_codecs.join(","))
+            .append_pair("p", &p.to_string())
+            .append_pair("sig", &token.signature)
+            .append_pair("token", &token.value);
+        url
+    }
 }
 
 fn strip_query_param(url: &mut Url, param: &str) {
@@ -98,12 +130,7 @@ mod tests {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        let get = |key: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        };
+        let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         assert_eq!(get("platform").as_deref(), Some("web"));
         assert_eq!(get("fast_bread").as_deref(), Some("true"));
         assert_eq!(get("supported_codecs").as_deref(), Some("av1,h265,h264"));

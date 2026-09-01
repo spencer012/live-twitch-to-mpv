@@ -30,6 +30,8 @@ use delayed::DelayedStreamManager;
 pub struct TwitchAdBlock {
     delayed: DelayedStreamManager,
     backup: BackupStreamManager,
+    delayed_enabled: bool,
+    backup_enabled: bool,
 
     is_showing_ad: bool,
     had_content: bool,
@@ -50,6 +52,18 @@ impl TwitchAdBlock {
         channel: &str,
         resolution: Option<(u32, u32)>,
     ) -> Self {
+        Self::new_with_options(client, api, usher, channel, resolution, true, true)
+    }
+
+    pub fn new_with_options(
+        client: reqwest::Client,
+        api: TwitchApi,
+        usher: UsherService,
+        channel: &str,
+        resolution: Option<(u32, u32)>,
+        delayed_enabled: bool,
+        backup_enabled: bool,
+    ) -> Self {
         tracing::info!("[AdBlock] Delayed playback ad-blocking enabled");
         Self {
             delayed: DelayedStreamManager::new(
@@ -60,6 +74,8 @@ impl TwitchAdBlock {
                 resolution,
             ),
             backup: BackupStreamManager::new(client, api, usher, channel, resolution),
+            delayed_enabled,
+            backup_enabled,
             is_showing_ad: false,
             had_content: false,
             preroll_fallback: false,
@@ -104,8 +120,10 @@ impl TwitchAdBlock {
     }
 
     async fn prepare_backup_segments(&mut self) {
-        let Some((player_type, content)) = self.backup.get_ad_free_playlist().await else {
-            tracing::debug!("[AdBlock] No ad-free backup available, will filter segments");
+        // Non-blocking: the backup flow runs in a background task; results
+        // are integrated on a later playlist reload once ready.
+        let Some((player_type, content)) = self.backup.poll_ad_free_playlist().await else {
+            tracing::debug!("[AdBlock] No ad-free backup ready yet, will filter segments");
             return;
         };
         tracing::debug!("[AdBlock] Using backup playlist from {player_type}");
@@ -170,13 +188,13 @@ impl SegmentHook for TwitchAdBlock {
                 // Pre-roll: ads before any real content has been seen. Delayed
                 // playback can't help (fresh tokens also get pre-rolls), so
                 // fall back to the backup player-type method.
-                if !self.had_content {
+                if !self.had_content && self.backup_enabled {
                     self.preroll_fallback = true;
                     tracing::info!(
                         "[AdBlock] Pre-roll ads detected, falling back to backup player method"
                     );
                     self.backup.on_ad_start();
-                } else {
+                } else if self.delayed_enabled {
                     self.delayed.on_ad_detected(current_sequence);
                 }
             }
@@ -222,7 +240,7 @@ impl SegmentHook for TwitchAdBlock {
         // Delayed playback mode: substitute every live-edge slot with delayed
         // content; if none is available, skip the slot entirely — never mix
         // live ad content into delayed playback.
-        if !self.preroll_fallback && self.delayed.is_active() {
+        if self.delayed_enabled && !self.preroll_fallback && self.delayed.is_active() {
             if let Some((url, seq)) = self.delayed.next_segment().await {
                 tracing::debug!("[AdBlock] Substituting delayed segment seq={seq}");
                 return SegmentAction::Substitute(url);

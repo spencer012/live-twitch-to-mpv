@@ -14,6 +14,8 @@ const HASH_PLAYBACK_ACCESS_TOKEN: &str =
 const HASH_CHANNEL_SHELL: &str = "fea4573a7bf2644f5b3f2cbbdcbee0d17312e48d2e55f080589d053aad353f11";
 const HASH_STREAM_METADATA: &str =
     "b57f9b910f8cd1a4659d894fe7550ccc81ec9052c01e438b290fd66a040b9b93";
+const HASH_FILTERABLE_VIDEOS: &str =
+    "67004f7881e65c297936f32c75246470629557a393788fb5a69d6d9a25a8fd5f";
 
 #[derive(Debug, Clone)]
 pub struct AccessToken {
@@ -25,6 +27,7 @@ pub struct AccessToken {
 pub struct ChannelMetadata {
     pub display_name: Option<String>,
     pub stream_id: Option<String>,
+    pub stream_created_at_unix_ms: Option<i64>,
     pub game: Option<String>,
     pub title: Option<String>,
 }
@@ -44,6 +47,13 @@ pub enum TokenResult {
     Offline,
     /// The API returned an error message (auth failure, integrity check, ...).
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct VodInfo {
+    pub id: String,
+    pub recorded_at_unix_ms: i64,
+    pub duration_sec: f64,
 }
 
 #[derive(Clone)]
@@ -125,6 +135,46 @@ impl TwitchApi {
         Ok(parse_token_response(&value))
     }
 
+    /// Request a playback token for a Twitch VOD.
+    pub async fn video_access_token(&self, vod_id: &str) -> Result<TokenResult> {
+        let query = Self::persisted_query(
+            "PlaybackAccessToken",
+            HASH_PLAYBACK_ACCESS_TOKEN,
+            json!({
+                "isLive": false,
+                "login": "",
+                "isVod": true,
+                "vodID": vod_id,
+                "playerType": "site",
+                "platform": "web",
+            }),
+        );
+        let (status, value) = self.call(&query).await?;
+        if ![200, 400, 401, 403].contains(&status) {
+            anyhow::bail!("unexpected VOD token response status: {status}");
+        }
+        Ok(parse_token_response(&value))
+    }
+
+    /// Return the channel's newest archived broadcasts.
+    pub async fn recent_vods(&self, channel: &str) -> Result<Vec<VodInfo>> {
+        let query = Self::persisted_query(
+            "FilterableVideoTower_Videos",
+            HASH_FILTERABLE_VIDEOS,
+            json!({
+                "channelOwnerLogin": channel,
+                "broadcastType": "ARCHIVE",
+                "videoSort": "TIME",
+                "limit": 10,
+            }),
+        );
+        let (status, value) = self.call(&query).await?;
+        if status != 200 {
+            anyhow::bail!("recent VOD request failed with status {status}");
+        }
+        Ok(parse_vods_response(&value))
+    }
+
     /// Fetch channel metadata via batched ChannelShell + StreamMetadata queries.
     /// Missing fields are left as `None` (e.g. when the channel is offline).
     pub async fn metadata_channel(&self, channel: &str) -> Result<ChannelMetadata> {
@@ -152,10 +202,7 @@ impl TwitchApi {
 
 fn parse_token_response(value: &Value) -> TokenResult {
     // {"errors": [{"message": ...}]}
-    if let Some(message) = value
-        .pointer("/errors/0/message")
-        .and_then(Value::as_str)
-    {
+    if let Some(message) = value.pointer("/errors/0/message").and_then(Value::as_str) {
         return TokenResult::Error(message.to_string());
     }
     // {"error": ..., "message": ...}
@@ -166,7 +213,9 @@ fn parse_token_response(value: &Value) -> TokenResult {
         return TokenResult::Error(format!("{error}: {message}"));
     }
 
-    let token = value.pointer("/data/streamPlaybackAccessToken");
+    let token = value
+        .pointer("/data/streamPlaybackAccessToken")
+        .or_else(|| value.pointer("/data/videoPlaybackAccessToken"));
     match token {
         Some(Value::Null) | None => TokenResult::Offline,
         Some(token) => {
@@ -188,9 +237,45 @@ fn parse_metadata_response(value: &Value) -> ChannelMetadata {
     ChannelMetadata {
         display_name: as_string(value.pointer("/0/data/userOrError/displayName")),
         stream_id: as_string(value.pointer("/1/data/user/stream/id")),
+        stream_created_at_unix_ms: value
+            .pointer("/1/data/user/stream/createdAt")
+            .and_then(Value::as_str)
+            .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+            .map(|date| date.timestamp_millis()),
         game: as_string(value.pointer("/1/data/user/stream/game/name")),
         title: as_string(value.pointer("/1/data/user/lastBroadcast/title")),
     }
+}
+
+fn parse_vods_response(value: &Value) -> Vec<VodInfo> {
+    value
+        .pointer("/data/user/videos/edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| {
+            let node = edge.get("node")?;
+            let id = node.get("id")?.as_str()?.to_string();
+            let recorded_at = node
+                .get("recordedAt")
+                .or_else(|| node.get("publishedAt"))
+                .or_else(|| node.get("createdAt"))?
+                .as_str()?;
+            let recorded_at_unix_ms = chrono::DateTime::parse_from_rfc3339(recorded_at)
+                .ok()?
+                .timestamp_millis();
+            let duration_sec = node
+                .get("lengthSeconds")
+                .or_else(|| node.get("durationSeconds"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            Some(VodInfo {
+                id,
+                recorded_at_unix_ms,
+                duration_sec,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -266,5 +351,23 @@ mod tests {
         let meta = parse_metadata_response(&value);
         assert!(!meta.is_live());
         assert_eq!(meta.title.as_deref(), Some("old title"));
+    }
+
+    #[test]
+    fn parses_recent_vods() {
+        let value = json!({
+            "data": { "user": { "videos": { "edges": [{
+                "node": {
+                    "id": "1234",
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "lengthSeconds": 90.0
+                }
+            }] } } }
+        });
+        let vods = parse_vods_response(&value);
+        assert_eq!(vods.len(), 1);
+        assert_eq!(vods[0].id, "1234");
+        assert_eq!(vods[0].recorded_at_unix_ms, 1_767_225_600_000);
+        assert_eq!(vods[0].duration_sec, 90.0);
     }
 }

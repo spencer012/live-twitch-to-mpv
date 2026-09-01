@@ -39,12 +39,61 @@ impl std::fmt::Display for State {
     }
 }
 
-pub struct DelayedStreamManager {
+/// The network half of the delayed manager: cloneable so fresh-playlist
+/// fetches can run in a background task without blocking the segment
+/// pipeline (the hook is consulted under a lock shared with the fetcher).
+#[derive(Clone)]
+struct FreshPlaylistFetcher {
     client: reqwest::Client,
     api: TwitchApi,
     usher: UsherService,
     channel: String,
     resolution: Option<(u32, u32)>,
+}
+
+impl FreshPlaylistFetcher {
+    /// Fetch a fresh token (popout/web), the usher multivariant playlist and
+    /// finally the media playlist matching our resolution.
+    async fn fetch(&self) -> Option<String> {
+        let token = match self.api.access_token(&self.channel, "popout", "web").await {
+            Ok(TokenResult::Token(token)) => token,
+            Ok(other) => {
+                tracing::debug!("[AdBlock] Fresh token request failed: {other:?}");
+                return None;
+            }
+            Err(err) => {
+                tracing::debug!("[AdBlock] Exception getting fresh token: {err:#}");
+                return None;
+            }
+        };
+
+        let url = self.usher.channel_url(&self.channel, &token, true);
+        let multivariant = self.http_get(url.as_str()).await?;
+
+        let variants = parse_multivariant_playlist(&multivariant, Some(url.as_str()));
+        let stream_url = select_by_resolution(&variants.variants, self.resolution)?;
+
+        self.http_get(&stream_url).await
+    }
+
+    async fn http_get(&self, url: &str) -> Option<String> {
+        let resp = self
+            .client
+            .get(url)
+            .timeout(HTTP_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::debug!("[AdBlock] Request failed with status {}", resp.status());
+            return None;
+        }
+        resp.text().await.ok()
+    }
+}
+
+pub struct DelayedStreamManager {
+    fetcher: FreshPlaylistFetcher,
 
     state: State,
     state_entered_at: Instant,
@@ -59,6 +108,8 @@ pub struct DelayedStreamManager {
     consumed_sequences: HashSet<i64>,
     known_sequences: HashSet<i64>,
 
+    /// In-flight background playlist fetch, harvested when finished.
+    pending_fetch: Option<tokio::task::JoinHandle<Option<String>>>,
     last_fetch: Option<Instant>,
     segments_recovered: usize,
 }
@@ -75,11 +126,13 @@ impl DelayedStreamManager {
             "[AdBlock] DelayedStreamManager initialized for channel={channel}, resolution={resolution:?}"
         );
         Self {
-            client,
-            api,
-            usher,
-            channel: channel.to_string(),
-            resolution,
+            fetcher: FreshPlaylistFetcher {
+                client,
+                api,
+                usher,
+                channel: channel.to_string(),
+                resolution,
+            },
             state: State::Normal,
             state_entered_at: Instant::now(),
             catchup_target_sequence: None,
@@ -89,6 +142,7 @@ impl DelayedStreamManager {
             delayed_index: 0,
             consumed_sequences: HashSet::new(),
             known_sequences: HashSet::new(),
+            pending_fetch: None,
             last_fetch: None,
             segments_recovered: 0,
         }
@@ -149,7 +203,10 @@ impl DelayedStreamManager {
                 self.transition_to(State::CatchingUp);
             }
             State::CatchingUp => {
-                if self.catchup_target_sequence.is_none_or(|t| current_sequence > t) {
+                if self
+                    .catchup_target_sequence
+                    .is_none_or(|t| current_sequence > t)
+                {
                     self.catchup_target_sequence = Some(current_sequence);
                 }
             }
@@ -169,48 +226,78 @@ impl DelayedStreamManager {
     }
 
     fn remaining(&self) -> usize {
-        self.delayed_segments.len().saturating_sub(self.delayed_index)
+        self.delayed_segments
+            .len()
+            .saturating_sub(self.delayed_index)
     }
 
-    /// Fetch more delayed segments if the rate limiter and queue level allow.
+    /// Kick off / harvest background playlist fetches if the rate limiter and
+    /// queue level allow. Never blocks on the network: results from the
+    /// background task are integrated on a later call.
     /// Returns true if segments are available afterwards.
     pub async fn try_get_delayed_segments(&mut self) -> bool {
         if self.state == State::Normal {
             return false;
         }
 
+        self.harvest_pending().await;
+
         let (min_interval, min_remaining) = match self.state {
             State::CatchingUp => (FETCH_INTERVAL_CATCHUP, MIN_REMAINING_BEFORE_FETCH + 2),
             _ => (FETCH_INTERVAL_DELAYED, MIN_REMAINING_BEFORE_FETCH),
         };
 
-        let elapsed_ok = self
-            .last_fetch
-            .is_none_or(|t| t.elapsed() >= min_interval);
+        let elapsed_ok = self.last_fetch.is_none_or(|t| t.elapsed() >= min_interval);
         let remaining = self.remaining();
-        if !elapsed_ok && remaining >= min_remaining {
+        if self.pending_fetch.is_some() || (!elapsed_ok && remaining >= min_remaining) {
             return remaining > 0;
         }
 
         tracing::debug!(
-            "[AdBlock] Fetching delayed segments (state={}, {remaining} remaining)",
+            "[AdBlock] Fetching delayed segments in background (state={}, {remaining} remaining)",
             self.state
         );
-        let fetched_at = Instant::now();
-        let Some(playlist_content) = self.fetch_fresh_playlist().await else {
-            tracing::debug!("[AdBlock] Failed to fetch fresh playlist");
-            return self.remaining() > 0;
-        };
-        self.last_fetch = Some(fetched_at);
+        let fetcher = self.fetcher.clone();
+        self.pending_fetch = Some(tokio::spawn(async move { fetcher.fetch().await }));
+        remaining > 0
+    }
 
-        let playlist = parse_media_playlist(&playlist_content, None);
+    /// Integrate the result of a finished background fetch, if any.
+    async fn harvest_pending(&mut self) {
+        if !self
+            .pending_fetch
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            return;
+        }
+        let handle = self.pending_fetch.take().expect("checked above");
+        match handle.await {
+            Ok(Some(content)) => {
+                self.last_fetch = Some(Instant::now());
+                self.integrate_playlist(&content);
+            }
+            Ok(None) => {
+                tracing::debug!("[AdBlock] Failed to fetch fresh playlist");
+            }
+            Err(err) => {
+                tracing::debug!("[AdBlock] Delayed fetch task failed: {err}");
+            }
+        }
+    }
+
+    fn integrate_playlist(&mut self, playlist_content: &str) {
+        let playlist = parse_media_playlist(playlist_content, None);
         let mut new_segments = Vec::new();
         let mut skipped_too_old = 0usize;
         for segment in &playlist.segments {
             if segment.ad || segment.prefetch {
                 continue;
             }
-            if self.min_delayed_sequence.is_some_and(|min| segment.num < min) {
+            if self
+                .min_delayed_sequence
+                .is_some_and(|min| segment.num < min)
+            {
                 skipped_too_old += 1;
                 continue;
             }
@@ -230,7 +317,7 @@ impl DelayedStreamManager {
                     self.min_delayed_sequence
                 );
             }
-            return self.remaining() > 0;
+            return;
         }
 
         let first = new_segments.first().map(|(_, n)| *n).unwrap_or(0);
@@ -240,7 +327,6 @@ impl DelayedStreamManager {
             new_segments.len()
         );
         self.delayed_segments.extend(new_segments);
-        true
     }
 
     /// Pop the next delayed segment; refetches when the queue runs dry.
@@ -292,47 +378,11 @@ impl DelayedStreamManager {
         self.delayed_index = 0;
         self.consumed_sequences.clear();
         self.known_sequences.clear();
+        if let Some(handle) = self.pending_fetch.take() {
+            handle.abort();
+        }
         self.last_fetch = None;
         self.segments_recovered = 0;
-    }
-
-    /// Fetch a fresh token (popout/web), the usher multivariant playlist and
-    /// finally the media playlist matching our resolution.
-    async fn fetch_fresh_playlist(&self) -> Option<String> {
-        let token = match self.api.access_token(&self.channel, "popout", "web").await {
-            Ok(TokenResult::Token(token)) => token,
-            Ok(other) => {
-                tracing::debug!("[AdBlock] Fresh token request failed: {other:?}");
-                return None;
-            }
-            Err(err) => {
-                tracing::debug!("[AdBlock] Exception getting fresh token: {err:#}");
-                return None;
-            }
-        };
-
-        let url = self.usher.channel_url(&self.channel, &token, true);
-        let multivariant = self.http_get(url.as_str()).await?;
-
-        let variants = parse_multivariant_playlist(&multivariant, Some(url.as_str()));
-        let stream_url = select_by_resolution(&variants.variants, self.resolution)?;
-
-        self.http_get(&stream_url).await
-    }
-
-    async fn http_get(&self, url: &str) -> Option<String> {
-        let resp = self
-            .client
-            .get(url)
-            .timeout(HTTP_TIMEOUT)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            tracing::debug!("[AdBlock] Request failed with status {}", resp.status());
-            return None;
-        }
-        resp.text().await.ok()
     }
 }
 

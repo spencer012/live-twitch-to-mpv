@@ -112,7 +112,9 @@ pub struct StreamConfig {
     /// Parallel segment download threads.
     #[serde(default = "d_segment_threads")]
     pub segment_threads: usize,
-    /// Per-segment request timeout in seconds.
+    /// Segment read timeout in seconds: the max time between received data
+    /// chunks (not a total per-segment deadline), so slow but live downloads
+    /// are never cut off.
     #[serde(default = "d_segment_timeout")]
     pub segment_timeout: f64,
     /// Overall stream read timeout in seconds.
@@ -190,7 +192,9 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: d_loglevel() }
+        Self {
+            level: d_loglevel(),
+        }
     }
 }
 
@@ -257,7 +261,10 @@ impl Config {
                 anyhow::bail!("config file not found: {}", p.display())
             }
             _ => {
-                tracing::debug!("No config file found, using defaults");
+                tracing::warn!(
+                    "No config.toml found next to the executable or in the current \
+                     directory; using defaults (player args, ad-block etc. are OFF)"
+                );
                 Ok(Config::default())
             }
         }
