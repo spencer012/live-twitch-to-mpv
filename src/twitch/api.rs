@@ -1,6 +1,7 @@
 //! Twitch GQL API client (persisted queries only, no client-integrity flow).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -109,11 +110,13 @@ impl TwitchApi {
             .get("operationName")
             .and_then(Value::as_str)
             .unwrap_or("batch");
+        tracing::info!(operation, "starting GQL request");
         let resp = self
             .client
             .post(GQL_URL)
             .headers(self.headers.clone())
             .json(body)
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .inspect_err(|error| {

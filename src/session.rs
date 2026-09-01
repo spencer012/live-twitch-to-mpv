@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -223,16 +225,28 @@ impl Session {
         let engine_timeline = timeline;
         let engine_events = events;
         let engine = tokio::spawn(async move {
-            if let Err(err) = run_engine(
+            let result = AssertUnwindSafe(run_engine(
                 config,
                 engine_timeline.clone(),
                 engine_events.clone(),
                 engine_cancel,
-            )
-            .await
-            {
-                tracing::error!("session engine failed: {err:#}");
-                let message = format!("{err:#}");
+            ))
+            .catch_unwind()
+            .await;
+            let fatal = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic");
+                    Some(format!("session engine panicked: {detail}"))
+                }
+            };
+            if let Some(message) = fatal {
+                tracing::error!(error = %message, "session engine failed");
                 engine_timeline.fail(message.clone()).await;
                 engine_events.push(SessionEvent::Error {
                     message,
@@ -399,7 +413,9 @@ async fn run_engine(
     events: Arc<EventQueue>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    tracing::info!(channel = %config.channel, "session engine started");
     let client = build_http_client()?;
+    tracing::info!("HTTP client initialized");
     let api = TwitchApi::new_with_auth(
         client.clone(),
         &BTreeMap::new(),
@@ -961,7 +977,16 @@ fn build_http_client() -> Result<reqwest::Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("Referer", PLAYER_REFERER.parse().unwrap());
     headers.insert("Origin", PLAYER_REFERER.parse().unwrap());
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("failed to select TLS protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
