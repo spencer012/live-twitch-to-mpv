@@ -16,7 +16,7 @@ path = "src/bin/twitchpipe.rs"
 
 [features]
 default = []
-android-jni = ["dep:jni"]
+android-jni = ["dep:jni", "dep:tracing-android"]
 
 [dependencies]
 anyhow = "1.0.103"
@@ -36,5 +36,6 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = "0.7.18"
 toml = "1.1.2"
 tracing = "0.1.44"
+tracing-android = { version = "0.2.0", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5.8"

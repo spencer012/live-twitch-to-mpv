@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 pub const DEFAULT_BUFFER_CAP_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -48,6 +48,7 @@ struct State {
     playback_cursor_sec: f64,
     total_bytes: u64,
     ended: bool,
+    fatal_error: Option<String>,
 }
 
 struct Inner {
@@ -55,11 +56,19 @@ struct Inner {
     cap_bytes: u64,
     next_id: AtomicU64,
     state: Mutex<State>,
+    changed: Notify,
 }
 
 #[derive(Clone)]
 pub struct Timeline {
     inner: Arc<Inner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistReadiness {
+    Ready,
+    Fatal(String),
+    TimedOut,
 }
 
 impl Timeline {
@@ -74,6 +83,7 @@ impl Timeline {
                 cap_bytes: cap_bytes.max(1),
                 next_id: AtomicU64::new(0),
                 state: Mutex::new(State::default()),
+                changed: Notify::new(),
             }),
         })
     }
@@ -122,8 +132,12 @@ impl Timeline {
             pending.push(staged);
             return Ok(state.committed_duration);
         }
+        let first_commit = state.segments.is_empty();
         let offset = Self::commit(&mut state, staged);
         drop(state);
+        if first_commit {
+            self.inner.changed.notify_waiters();
+        }
         self.evict().await;
         Ok(offset)
     }
@@ -140,6 +154,7 @@ impl Timeline {
 
     pub async fn finish_gap(&self, mut backfill: Vec<StagedSegment>) -> f64 {
         let mut state = self.inner.state.lock().await;
+        let was_empty = state.segments.is_empty();
         let mut pending = state.pending_live.take().unwrap_or_default();
         if let Some(first) = backfill.first_mut() {
             first.discontinuity = true;
@@ -154,7 +169,11 @@ impl Timeline {
             Self::commit(&mut state, staged);
         }
         let duration = state.committed_duration;
+        let became_ready = was_empty && !state.segments.is_empty();
         drop(state);
+        if became_ready {
+            self.inner.changed.notify_waiters();
+        }
         self.evict().await;
         duration
     }
@@ -225,8 +244,45 @@ impl Timeline {
         out
     }
 
+    pub async fn wait_until_ready(&self, max_wait: std::time::Duration) -> PlaylistReadiness {
+        let wait = async {
+            loop {
+                let changed = self.inner.changed.notified();
+                {
+                    let state = self.inner.state.lock().await;
+                    if !state.segments.is_empty() {
+                        return PlaylistReadiness::Ready;
+                    }
+                    if let Some(message) = &state.fatal_error {
+                        return PlaylistReadiness::Fatal(message.clone());
+                    }
+                }
+                changed.await;
+            }
+        };
+        match tokio::time::timeout(max_wait, wait).await {
+            Ok(readiness) => readiness,
+            Err(_) => {
+                let state = self.inner.state.lock().await;
+                if !state.segments.is_empty() {
+                    PlaylistReadiness::Ready
+                } else if let Some(message) = &state.fatal_error {
+                    PlaylistReadiness::Fatal(message.clone())
+                } else {
+                    PlaylistReadiness::TimedOut
+                }
+            }
+        }
+    }
+
+    pub async fn fail(&self, message: String) {
+        self.inner.state.lock().await.fatal_error = Some(message);
+        self.inner.changed.notify_waiters();
+    }
+
     pub async fn end(&self) {
         self.inner.state.lock().await.ended = true;
+        self.inner.changed.notify_waiters();
     }
 
     pub async fn committed_duration(&self) -> f64 {
@@ -339,6 +395,42 @@ mod tests {
         let live_after_pos = playlist.rfind(",live").unwrap();
         assert!(vod_pos < live_after_pos);
         assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY").count(), 2);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_first_commit() {
+        let dir = temp_dir("readiness");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let timeline = Timeline::new(&dir, 1024).await.unwrap();
+        let waiting = {
+            let timeline = timeline.clone();
+            tokio::spawn(async move {
+                timeline
+                    .wait_until_ready(std::time::Duration::from_secs(1))
+                    .await
+            })
+        };
+        timeline
+            .append_live(b"first", 2.0, false, None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap(), PlaylistReadiness::Ready);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_fatal_error() {
+        let dir = temp_dir("fatal-readiness");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let timeline = Timeline::new(&dir, 1024).await.unwrap();
+        timeline.fail("network failed".to_string()).await;
+        assert_eq!(
+            timeline
+                .wait_until_ready(std::time::Duration::from_secs(1))
+                .await,
+            PlaylistReadiness::Fatal("network failed".to_string())
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

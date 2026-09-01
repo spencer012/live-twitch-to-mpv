@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
 use jni::JNIEnv;
@@ -12,6 +12,30 @@ use crate::session::{Session, SessionConfig};
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static SESSIONS: OnceLock<Mutex<HashMap<i64, Arc<Session>>>> = OnceLock::new();
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+static LOGGING_INIT: Once = Once::new();
+
+fn init_logging() {
+    LOGGING_INIT.call_once(|| {
+        #[cfg(target_os = "android")]
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+
+            let filter = tracing_subscriber::EnvFilter::new("info,twitchpipe_core=debug");
+            match tracing_android::layer("TwitchPipeCore") {
+                Ok(android) => {
+                    let _ = tracing_subscriber::registry()
+                        .with(filter)
+                        .with(android)
+                        .try_init();
+                }
+                Err(error) => {
+                    eprintln!("failed to create TwitchPipeCore logcat layer: {error}");
+                }
+            }
+        }
+    });
+}
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
@@ -37,6 +61,8 @@ pub extern "system" fn Java_dev_twitchpipe_TwitchPipe_startSession(
     _class: JClass,
     config_json: JString,
 ) -> jlong {
+    init_logging();
+    tracing::info!("JNI startSession called");
     let result = (|| {
         let json: String = env
             .get_string(&config_json)
@@ -49,11 +75,13 @@ pub extern "system" fn Java_dev_twitchpipe_TwitchPipe_startSession(
             .map_err(|error| format!("{error:#}"))?;
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         sessions().lock().unwrap().insert(handle, session);
+        tracing::info!(handle, "JNI session started");
         Ok::<i64, String>(handle)
     })();
     match result {
         Ok(handle) => handle,
         Err(message) => {
+            tracing::error!(error = %message, "JNI startSession failed");
             throw(&mut env, message);
             0
         }
@@ -135,6 +163,7 @@ pub extern "system" fn Java_dev_twitchpipe_TwitchPipe_stopSession(
     _class: JClass,
     handle: jlong,
 ) {
+    tracing::info!(handle, "JNI stopSession called");
     let session = sessions().lock().unwrap().remove(&handle);
     let Some(session) = session else {
         throw(

@@ -24,9 +24,13 @@ use crate::hls::m3u8::{
     MediaPlaylist, MediaSegment, VariantStream, parse_media_playlist, parse_multivariant_playlist,
 };
 use crate::quality::select_variant;
-use crate::timeline::{DEFAULT_BUFFER_CAP_BYTES, SegmentSource, StagedSegment, Timeline};
+use crate::timeline::{
+    DEFAULT_BUFFER_CAP_BYTES, PlaylistReadiness, SegmentSource, StagedSegment, Timeline,
+};
 use crate::twitch::api::{TokenResult, TwitchApi, VodInfo};
 use crate::twitch::usher::{PLAYER_REFERER, UsherService};
+
+const PLAYLIST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +91,8 @@ fn default_recovery_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum SessionEvent {
+    #[serde(rename = "ready")]
+    Ready,
     #[serde(rename = "liveEdge")]
     LiveEdge {
         #[serde(rename = "unixMs")]
@@ -165,6 +171,12 @@ impl Session {
             std::process::id(),
             Utc::now().timestamp_millis()
         ));
+        tracing::info!(
+            channel = %config.channel,
+            quality = %config.quality,
+            buffer_dir = %session_dir.display(),
+            "starting session"
+        );
         let timeline = Timeline::new(session_dir, config.buffer_cap_bytes).await?;
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -190,12 +202,20 @@ impl Session {
             .route("/control/position", post(report_position))
             .with_state(timeline.clone());
         let server_cancel = cancel.clone();
+        let server_timeline = timeline.clone();
+        let server_events = events.clone();
         let server = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app)
                 .with_graceful_shutdown(server_cancel.cancelled_owned())
                 .await
             {
                 tracing::error!("local HLS server failed: {err}");
+                let message = format!("local HLS server failed: {err}");
+                server_timeline.fail(message.clone()).await;
+                server_events.push(SessionEvent::Error {
+                    message,
+                    fatal: true,
+                });
             }
         });
 
@@ -211,13 +231,17 @@ impl Session {
             )
             .await
             {
+                tracing::error!("session engine failed: {err:#}");
+                let message = format!("{err:#}");
+                engine_timeline.fail(message.clone()).await;
                 engine_events.push(SessionEvent::Error {
-                    message: format!("{err:#}"),
+                    message,
                     fatal: true,
                 });
             }
             engine_timeline.end().await;
             engine_events.push(SessionEvent::Ended);
+            tracing::info!("session engine stopped");
         });
         session.tasks.lock().unwrap().extend([server, engine]);
         Ok(session)
@@ -236,6 +260,7 @@ impl Session {
     }
 
     pub async fn stop(&self) {
+        tracing::info!(local_url = %self.local_url, "stopping session");
         self.cancel.cancel();
         self.timeline.end().await;
         for task in self.tasks.lock().unwrap().drain(..) {
@@ -251,6 +276,21 @@ struct PositionReport {
 }
 
 async fn serve_playlist(State(timeline): State<Timeline>) -> Response {
+    match timeline.wait_until_ready(PLAYLIST_READY_TIMEOUT).await {
+        PlaylistReadiness::Ready => {}
+        PlaylistReadiness::Fatal(message) => {
+            tracing::warn!("playlist request returning fatal session error: {message}");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, &message);
+        }
+        PlaylistReadiness::TimedOut => {
+            let message = format!(
+                "stream did not become ready within {} seconds",
+                PLAYLIST_READY_TIMEOUT.as_secs()
+            );
+            tracing::warn!("{message}");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, &message);
+        }
+    }
     let playlist = timeline.playlist().await;
     Response::builder()
         .status(StatusCode::OK)
@@ -260,6 +300,19 @@ async fn serve_playlist(State(timeline): State<Timeline>) -> Response {
         )
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
         .body(Body::from(playlist))
+        .unwrap()
+}
+
+fn json_error_response(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    Response::builder()
+        .status(status)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -353,7 +406,24 @@ async fn run_engine(
         config.auth_token.as_deref(),
     )?;
     let usher = UsherService::new(&["h264".to_string()]);
-    let metadata = api.metadata_channel(&config.channel).await.ok();
+    let metadata = match api.metadata_channel(&config.channel).await {
+        Ok(metadata) => {
+            tracing::info!(
+                channel = %config.channel,
+                live = metadata.is_live(),
+                "channel metadata request succeeded"
+            );
+            Some(metadata)
+        }
+        Err(error) => {
+            tracing::warn!(
+                channel = %config.channel,
+                error = %error,
+                "channel metadata request failed"
+            );
+            None
+        }
+    };
     let stream_started_ms = metadata
         .as_ref()
         .and_then(|metadata| metadata.stream_created_at_unix_ms);
@@ -398,6 +468,8 @@ async fn run_engine(
     let mut sequence = None;
     let mut last_productive = Instant::now();
     let mut backfills: Vec<JoinHandle<()>> = Vec::new();
+    let mut committed_segments = 0_u64;
+    let mut ready_emitted = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -482,6 +554,23 @@ async fn run_engine(
                     let offset = timeline
                         .append_live(&bytes, segment.duration, segment.discontinuity, unix_ms)
                         .await?;
+                    committed_segments += 1;
+                    if !ready_emitted {
+                        events.push(SessionEvent::Ready);
+                        ready_emitted = true;
+                        tracing::info!(
+                            segment = segment.num,
+                            bytes = bytes.len(),
+                            "first segment committed; session ready"
+                        );
+                    } else if committed_segments % 10 == 0 {
+                        tracing::info!(
+                            committed_segments,
+                            segment = segment.num,
+                            bytes = bytes.len(),
+                            "segments committed"
+                        );
+                    }
                     events.push(SessionEvent::LiveEdge {
                         unix_ms: unix_ms.unwrap_or_else(|| Utc::now().timestamp_millis()),
                         stream_offset_sec: offset + segment.duration,
@@ -534,10 +623,25 @@ async fn resolve_live(
     allow_offline: bool,
 ) -> Result<ResolvedLive> {
     let token = match api.access_token(channel, "popout", "site").await? {
-        TokenResult::Token(token) => token,
-        TokenResult::Offline if allow_offline => bail!("channel offline"),
-        TokenResult::Offline => bail!("no playable streams found on channel {channel}"),
-        TokenResult::Error(message) => bail!("Twitch access token failed: {message}"),
+        TokenResult::Token(token) => {
+            tracing::info!(channel, "received Twitch playback access token");
+            token
+        }
+        TokenResult::Offline if allow_offline => {
+            tracing::warn!(
+                channel,
+                "Twitch returned no playback token; channel offline"
+            );
+            bail!("channel offline")
+        }
+        TokenResult::Offline => {
+            tracing::warn!(channel, "Twitch returned no playback token");
+            bail!("no playable streams found on channel {channel}")
+        }
+        TokenResult::Error(message) => {
+            tracing::error!(channel, error = %message, "Twitch access token request failed");
+            bail!("Twitch access token failed: {message}")
+        }
     };
     let primary_url = usher.channel_url(channel, &token, false);
     let legacy_url = usher.legacy_channel_url(channel, &token, false);
@@ -559,6 +663,7 @@ async fn fetch_first_playlist(
 ) -> Result<(url::Url, String)> {
     let mut last_error = None;
     for url in urls {
+        let endpoint = url[..url::Position::BeforeQuery].trim_end_matches('?');
         match client
             .get(url.as_str())
             .timeout(Duration::from_secs(10))
@@ -566,15 +671,41 @@ async fn fetch_first_playlist(
             .await
         {
             Ok(response) if response.status().is_success() => {
-                return Ok((url.clone(), response.text().await?));
+                tracing::info!(endpoint, status = %response.status(), "usher playlist request succeeded");
+                let text = response
+                    .text()
+                    .await
+                    .with_context(|| format!("failed to read usher response from {endpoint}"))?;
+                return Ok((url.clone(), text));
             }
             Ok(response) => {
-                last_error = Some(anyhow!("{} returned {}", url, response.status()));
+                tracing::warn!(endpoint, status = %response.status(), "usher playlist request failed");
+                last_error = Some(anyhow!("{endpoint} returned {}", response.status()));
             }
-            Err(error) => last_error = Some(error.into()),
+            Err(error) => {
+                let kind = reqwest_error_kind(&error);
+                tracing::warn!(endpoint, error_kind = kind, "usher playlist request failed");
+                last_error = Some(anyhow!("usher request to {endpoint} failed: {kind}"));
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("no playlist URLs supplied")))
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_body() {
+        "response body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "network"
+    }
 }
 
 async fn recover_live(

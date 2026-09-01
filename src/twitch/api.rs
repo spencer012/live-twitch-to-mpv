@@ -105,6 +105,10 @@ impl TwitchApi {
     }
 
     async fn call(&self, body: &Value) -> Result<(u16, Value)> {
+        let operation = body
+            .get("operationName")
+            .and_then(Value::as_str)
+            .unwrap_or("batch");
         let resp = self
             .client
             .post(GQL_URL)
@@ -112,8 +116,12 @@ impl TwitchApi {
             .json(body)
             .send()
             .await
+            .inspect_err(|error| {
+                tracing::error!(operation, error = %error, "GQL request failed");
+            })
             .context("GQL request failed")?;
         let status = resp.status().as_u16();
+        tracing::info!(operation, status, "GQL request completed");
         let value: Value = resp.json().await.context("invalid GQL JSON response")?;
         Ok((status, value))
     }
@@ -146,7 +154,19 @@ impl TwitchApi {
             anyhow::bail!("unexpected GQL response status: {status}");
         }
 
-        Ok(parse_token_response(&value))
+        let result = parse_token_response(&value);
+        match &result {
+            TokenResult::Token(_) => {
+                tracing::info!(status, "GQL live token response contained a token")
+            }
+            TokenResult::Offline => {
+                tracing::warn!(status, "GQL live token response contained no token")
+            }
+            TokenResult::Error(message) => {
+                tracing::error!(status, error = %message, "GQL live token response contained an error")
+            }
+        }
+        Ok(result)
     }
 
     /// Request a playback token for a Twitch VOD.
@@ -167,7 +187,19 @@ impl TwitchApi {
         if ![200, 400, 401, 403].contains(&status) {
             anyhow::bail!("unexpected VOD token response status: {status}");
         }
-        Ok(parse_token_response(&value))
+        let result = parse_token_response(&value);
+        match &result {
+            TokenResult::Token(_) => {
+                tracing::info!(status, "GQL VOD token response contained a token")
+            }
+            TokenResult::Offline => {
+                tracing::warn!(status, "GQL VOD token response contained no token")
+            }
+            TokenResult::Error(message) => {
+                tracing::error!(status, error = %message, "GQL VOD token response contained an error")
+            }
+        }
+        Ok(result)
     }
 
     /// Return the channel's newest archived broadcasts.
