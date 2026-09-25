@@ -20,6 +20,14 @@ cargo build --release
 
 The binary ends up at `target\release\twitchpipe.exe`.
 
+On Windows, a normal Rust install already puts `~\.cargo\bin` on PATH. To copy only `twitchpipe.exe` there, without adding the whole `target\release` directory:
+
+```powershell
+sfw cargo install --path . --locked --target-dir .\target
+```
+
+That copies only the executable. Run it again after you rebuild or update the repo.
+
 For development checks:
 
 ```powershell
@@ -47,6 +55,7 @@ Key sections:
 | --- | --- |
 | `[twitch]` | `low_latency`, `supported_codecs`, `ad_block`, `api_headers` (OAuth token) |
 | `[player]` | `command`, `args`, `no_close`, `include_channel_name` |
+| `[replay]` | `enabled`, `chatterino_url`, `report_interval_ms` |
 | `[stream]` | `ring_buffer_mb`, `live_edge`, `persist_stream`, `recovery_timeout`, segment attempts/threads/timeouts |
 | `[retry]` | `streams` (poll interval), `max` (poll count), `open` (open attempts) |
 | `[quality]` | `priority` list, e.g. `["1080p60", "1080p", "720p60", "best"]` |
@@ -71,7 +80,46 @@ twitchpipe --streams some_channel
 twitchpipe --log-level debug some_channel
 ```
 
+Before starting mpv, TwitchPipe measures the median duration of recent
+completed, non-ad HLS segments. For a cadence of 3 seconds or longer, it tells
+the `catchup_live_v2.lua` script to skip mpv's runtime `low-latency` profile
+near the live edge. This avoids a decoder restart and keeps mpv's normal
+cache-pause behavior on streams with long gaps between keyframes. Catch-up
+speed control, the large mpv cache, and Twitch's progressive prefetch remain
+enabled. `--check` prints the measured cadence and the profile decision.
+If the playlist cannot provide three completed content segments, TwitchPipe
+keeps the configured mpv behavior.
+
 ## How it works
+
+### Replay chat in Chatterino
+
+Set `[replay] enabled = true` in `config.toml`, then start a Twitch stream in
+TwitchPipe. In Chatterino, press Ctrl+Alt+R on that channel's split or choose
+"Replay chat from player" in the split's More menu. The split follows mpv's
+playback time while it is behind live, and returns to normal live scrolling
+near the stream edge. The border is green during replay, blue near live, and
+orange while waiting for a player. Hover or the configured pause modifier
+temporarily stops tracking so you can read older chat.
+While replay follows playback, Chatterino hides "More messages below". If you
+pause chat and scroll manually, the banner returns until chat resumes following.
+
+TwitchPipe creates a private mpv IPC endpoint for each process and connects to
+Chatterino at `ws://127.0.0.1:38776/replay` by default. If Chatterino is not
+running, TwitchPipe keeps retrying and shows one mpv warning. Change
+`chatterino_url` if you changed Chatterino's listener port. Replay is available
+only for messages still held in the split's scrollback.
+TwitchPipe also records each connection change in mpv's backtick console. It
+keeps notices until that console is opened, so an early disconnect is visible
+later.
+With `[player] no_close = true`, TwitchPipe keeps the replay connection alive
+after the stream ends. It exits when the remaining mpv window closes, so
+seeking through mpv's buffered video can still move replay chat.
+
+Playback positions are reported every 100 ms by default. Chatterino keeps
+discrete message jumps but breaks large routine advances into steps of at most
+five messages every 50 ms. Seeking in mpv jumps chat directly to the sought
+time.
 
 ```
 TwitchApi (GQL) -> Usher URL -> PlaylistWorker -> SegmentFetcher -> byte buffer -> mpv stdin

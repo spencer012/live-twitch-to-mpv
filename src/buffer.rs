@@ -25,8 +25,14 @@ pub fn byte_channel(capacity: usize) -> (ByteSender, ByteReceiver) {
 #[derive(Debug)]
 pub struct ChannelClosed;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Chunk {
+    Data(Bytes),
+    SegmentEnd { pdt_end_ms: i64 },
+}
+
 pub struct ByteSender {
-    tx: mpsc::UnboundedSender<(Bytes, tokio::sync::OwnedSemaphorePermit)>,
+    tx: mpsc::UnboundedSender<(Chunk, Option<tokio::sync::OwnedSemaphorePermit>)>,
     semaphore: Arc<Semaphore>,
     capacity: usize,
 }
@@ -44,21 +50,29 @@ impl ByteSender {
                 .acquire_many_owned(chunk.len() as u32)
                 .await
                 .map_err(|_| ChannelClosed)?;
-            self.tx.send((chunk, permit)).map_err(|_| ChannelClosed)?;
+            self.tx
+                .send((Chunk::Data(chunk), Some(permit)))
+                .map_err(|_| ChannelClosed)?;
         }
         Ok(())
+    }
+
+    pub fn segment_end(&self, pdt_end_ms: i64) -> Result<(), ChannelClosed> {
+        self.tx
+            .send((Chunk::SegmentEnd { pdt_end_ms }, None))
+            .map_err(|_| ChannelClosed)
     }
 }
 
 pub struct ByteReceiver {
-    rx: mpsc::UnboundedReceiver<(Bytes, tokio::sync::OwnedSemaphorePermit)>,
+    rx: mpsc::UnboundedReceiver<(Chunk, Option<tokio::sync::OwnedSemaphorePermit>)>,
 }
 
 impl ByteReceiver {
     /// Receive the next chunk; `None` means the stream has ended.
-    pub async fn recv(&mut self) -> Option<Bytes> {
+    pub async fn recv(&mut self) -> Option<Chunk> {
         // Dropping the permit frees buffer space for the senders.
-        self.rx.recv().await.map(|(bytes, _permit)| bytes)
+        self.rx.recv().await.map(|(chunk, _permit)| chunk)
     }
 }
 
@@ -78,9 +92,15 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!pending.is_finished());
 
-        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"12345678"));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Chunk::Data(Bytes::from_static(b"12345678"))
+        );
         pending.await.unwrap();
-        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"abc"));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Chunk::Data(Bytes::from_static(b"abc"))
+        );
     }
 
     #[tokio::test]
@@ -91,9 +111,26 @@ mod tests {
         });
         let mut out = Vec::new();
         while out.len() < 9 {
-            out.extend_from_slice(&rx.recv().await.unwrap());
+            if let Chunk::Data(data) = rx.recv().await.unwrap() {
+                out.extend_from_slice(&data);
+            }
         }
         sender.await.unwrap();
         assert_eq!(out, b"123456789");
+    }
+
+    #[tokio::test]
+    async fn segment_markers_keep_byte_order() {
+        let (tx, mut rx) = byte_channel(4);
+        tx.send(Bytes::from_static(b"abcd")).await.unwrap();
+        tx.segment_end(1234).unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(Chunk::Data(Bytes::from_static(b"abcd")))
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(Chunk::SegmentEnd { pdt_end_ms: 1234 })
+        );
     }
 }

@@ -65,6 +65,26 @@ pub struct MediaPlaylist {
     pub dateranges_ads: Vec<DateRange>,
 }
 
+/// Median duration of recent completed content segments. Twitch's target
+/// duration is often 6 seconds even when completed segments are 2 seconds,
+/// so it cannot be used to classify the actual cadence.
+pub fn segment_cadence_seconds(playlist: &MediaPlaylist) -> Option<f64> {
+    let mut durations: Vec<f64> = playlist
+        .segments
+        .iter()
+        .rev()
+        .filter(|segment| !segment.prefetch && !segment.ad)
+        .map(|segment| segment.duration)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .take(5)
+        .collect();
+    if durations.len() < 3 {
+        return None;
+    }
+    durations.sort_by(f64::total_cmp);
+    Some(durations[durations.len() / 2])
+}
+
 #[derive(Debug, Clone)]
 pub struct VariantStream {
     pub name: String,
@@ -486,6 +506,38 @@ mod tests {
         assert_eq!(playlist.segments[0].title.as_deref(), Some("live"));
         assert!(!playlist.segments[0].ad);
         assert!(!playlist.is_endlist);
+    }
+
+    #[test]
+    fn cadence_uses_completed_segments_instead_of_targetduration_or_prefetch() {
+        let playlist = seg_playlist(
+            "#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00.000Z\n\
+             #EXTINF:2.000,live\nseg1.ts\n\
+             #EXTINF:2.000,live\nseg2.ts\n\
+             #EXTINF:2.000,live\nseg3.ts\n\
+             #EXT-X-TWITCH-PREFETCH:next.ts\n",
+        );
+        assert_eq!(segment_cadence_seconds(&playlist), Some(2.0));
+    }
+
+    #[test]
+    fn cadence_ignores_ad_and_short_outlier() {
+        let playlist = seg_playlist(
+            "#EXT-X-TARGETDURATION:6\n\
+             #EXTINF:4.167,live\nseg1.ts\n\
+             #EXTINF:4.166,live\nseg2.ts\n\
+             #EXTINF:1.000,live\nshort.ts\n\
+             #EXTINF:4.167,live\nseg3.ts\n\
+             #EXTINF:6.000,Amazon|ad\nad.ts\n",
+        );
+        assert_eq!(segment_cadence_seconds(&playlist), Some(4.167));
+    }
+
+    #[test]
+    fn cadence_needs_three_completed_content_segments() {
+        let playlist = seg_playlist("#EXTINF:4.167,live\nseg1.ts\n#EXTINF:4.166,live\nseg2.ts\n");
+        assert_eq!(segment_cadence_seconds(&playlist), None);
     }
 
     #[test]

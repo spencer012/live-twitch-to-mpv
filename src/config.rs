@@ -24,6 +24,37 @@ pub struct Config {
     pub quality: QualityConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub replay: ReplayConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_replay_url")]
+    pub chatterino_url: String,
+    #[serde(default = "default_report_interval")]
+    pub report_interval_ms: u64,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chatterino_url: default_replay_url(),
+            report_interval_ms: default_report_interval(),
+        }
+    }
+}
+
+fn default_replay_url() -> String {
+    "ws://127.0.0.1:38776/replay".into()
+}
+
+fn default_report_interval() -> u64 {
+    100
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -345,5 +376,8 @@ prefer_config = true
         assert!((config.stream.segment_timeout - 10.0).abs() < f64::EPSILON);
         assert!((config.stream.stream_timeout - 60.0).abs() < f64::EPSILON);
         assert!(!config.twitch.ad_block);
+        assert!(!config.replay.enabled);
+        assert_eq!(config.replay.chatterino_url, "ws://127.0.0.1:38776/replay");
+        assert_eq!(config.replay.report_interval_ms, 100);
     }
 }

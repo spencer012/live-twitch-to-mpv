@@ -29,7 +29,8 @@ command = "mpv"
 args = "--profile='low-latency-stream' --keep-open=always --loop=no"
 
 # Don't kill the player when the stream ends; stdin is closed and mpv's
-# --keep-open takes over. Default: false
+# --keep-open takes over. Replay tracking stays active until mpv closes.
+# Default: false
 no_close = true
 
 # Pass the channel login to mpv via
@@ -38,6 +39,14 @@ include_channel_name = true
 
 # Show player output instead of discarding it. Default: false
 verbose = false
+
+[replay]
+# Send mpv playback time to Chatterino's local replay listener. Default: false
+enabled = false
+# Match Chatterino's Replay chat listen port. Default: ws://127.0.0.1:38776/replay
+chatterino_url = "ws://127.0.0.1:38776/replay"
+# Position reports while playing. Default: 100 ms
+report_interval_ms = 100
 
 [stream]
 # Output buffer size in MiB. Default: 16

@@ -188,6 +188,13 @@ impl SegmentFetcher {
 
             match failure {
                 None => {
+                    if let Some(date) = job.segment.date {
+                        let end_ms = date.timestamp_millis()
+                            + (job.segment.duration * 1000.0).round() as i64;
+                        if out.segment_end(end_ms).is_err() {
+                            break 'jobs;
+                        }
+                    }
                     tracing::debug!(
                         "Segment {} complete ({} bytes{})",
                         job.segment.num,
@@ -438,7 +445,9 @@ mod tests {
         drop(seg_tx);
         let mut out = Vec::new();
         while let Some(chunk) = byte_rx.recv().await {
-            out.extend_from_slice(&chunk);
+            if let crate::buffer::Chunk::Data(data) = chunk {
+                out.extend_from_slice(&data);
+            }
         }
         run.await.unwrap();
         out

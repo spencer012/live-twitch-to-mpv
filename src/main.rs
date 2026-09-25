@@ -7,11 +7,13 @@ use clap::Parser;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::adblock::TwitchAdBlock;
-use crate::buffer::byte_channel;
+use crate::buffer::{Chunk, byte_channel};
 use crate::config::Config;
 use crate::hls::fetch::{FetcherConfig, SegmentFetcher};
 use crate::hls::hook::{AdFilterHook, SegmentHook};
-use crate::hls::m3u8::{VariantStream, parse_multivariant_playlist};
+use crate::hls::m3u8::{
+    VariantStream, parse_media_playlist, parse_multivariant_playlist, segment_cadence_seconds,
+};
 use crate::hls::worker::{PlaylistWorker, RecoveryRequest, WorkerConfig};
 use crate::player::Player;
 use crate::quality::select_variant;
@@ -21,6 +23,9 @@ use crate::twitch::api::{TokenResult, TwitchApi};
 use crate::twitch::usher::{PLAYER_REFERER, UsherService};
 
 const PREBUFFER_SIZE: usize = 8192;
+// Completed 2-second Twitch segments work with mpv's runtime low-latency
+// profile. The 4.17-second cadence leaves a much longer keyframe recovery gap.
+const LONG_SEGMENT_CADENCE_SECONDS: f64 = 3.0;
 
 #[derive(Parser)]
 #[command(
@@ -325,6 +330,22 @@ enum StreamEnd {
     PlayerClosed,
 }
 
+async fn detect_segment_cadence(client: &reqwest::Client, url: &str) -> Result<Option<f64>> {
+    let text = client
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("cadence playlist request failed")?
+        .error_for_status()
+        .context("cadence playlist returned an error")?
+        .text()
+        .await
+        .context("failed to read cadence playlist")?;
+    let playlist = parse_media_playlist(&text, Some(url));
+    Ok(segment_cadence_seconds(&playlist))
+}
+
 /// Run the full pipeline for one stream: worker -> fetcher -> buffer -> player.
 async fn run_stream(
     client: &reqwest::Client,
@@ -335,6 +356,28 @@ async fn run_stream(
     resolved: &ResolvedStream,
     title: Option<&str>,
 ) -> Result<StreamEnd> {
+    let disable_mpv_low_latency = match detect_segment_cadence(client, &resolved.variant.uri).await
+    {
+        Ok(Some(seconds)) => {
+            let disable = seconds >= LONG_SEGMENT_CADENCE_SECONDS;
+            tracing::info!(
+                "HLS segment cadence: {seconds:.3}s; mpv near-live low-latency profile: {}",
+                if disable { "disabled" } else { "enabled" }
+            );
+            disable
+        }
+        Ok(None) => {
+            tracing::warn!("HLS cadence unavailable; keeping mpv's configured profile behavior");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                "HLS cadence check failed: {error:#}; keeping configured profile behavior"
+            );
+            false
+        }
+    };
+
     let hook: Arc<Mutex<dyn SegmentHook>> = if config.twitch.ad_block {
         Arc::new(Mutex::new(TwitchAdBlock::new(
             client.clone(),
@@ -405,18 +448,20 @@ async fn run_stream(
     async fn read(
         rx: &mut crate::buffer::ByteReceiver,
         timeout: Duration,
-    ) -> Result<Option<bytes::Bytes>, tokio::time::error::Elapsed> {
+    ) -> Result<Option<Chunk>, tokio::time::error::Elapsed> {
         tokio::time::timeout(timeout, rx.recv()).await
     }
 
     // Prebuffer before launching the player.
     tracing::debug!("Pre-buffering {PREBUFFER_SIZE} bytes...");
-    let mut prebuffer: Vec<bytes::Bytes> = Vec::new();
+    let mut prebuffer: Vec<Chunk> = Vec::new();
     let mut prebuffered = 0usize;
     while prebuffered < PREBUFFER_SIZE {
         match read(&mut byte_rx, stream_timeout).await {
             Ok(Some(chunk)) => {
-                prebuffered += chunk.len();
+                if let Chunk::Data(data) = &chunk {
+                    prebuffered += data.len();
+                }
                 prebuffer.push(chunk);
             }
             Ok(None) => {
@@ -435,25 +480,57 @@ async fn run_stream(
         }
     }
 
-    let mut player = Player::spawn(&config.player, channel, title)?;
+    let mut player = Player::spawn(
+        &config.player,
+        channel,
+        title,
+        config.replay.enabled,
+        disable_mpv_low_latency,
+    )?;
+    let (segment_end_tx, segment_end_rx) = mpsc::unbounded_channel();
+    let replay_task = player.ipc_path.clone().map(|path| {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        (
+            shutdown_tx,
+            tokio::spawn(crate::replay::run(
+                config.replay.clone(),
+                channel.to_owned(),
+                path,
+                segment_end_rx,
+                shutdown_rx,
+            )),
+        )
+    });
     tracing::info!("Player started, streaming...");
 
     let mut result = StreamEnd::Ended;
     'outer: {
         for chunk in prebuffer {
-            if player.write(&chunk).await.is_err() {
-                result = StreamEnd::PlayerClosed;
-                break 'outer;
+            match chunk {
+                Chunk::Data(data) => {
+                    if player.write(&data).await.is_err() {
+                        result = StreamEnd::PlayerClosed;
+                        break 'outer;
+                    }
+                }
+                Chunk::SegmentEnd { pdt_end_ms } => {
+                    let _ = segment_end_tx.send(pdt_end_ms);
+                }
             }
         }
         loop {
             match read(&mut byte_rx, stream_timeout).await {
-                Ok(Some(chunk)) => {
-                    if player.write(&chunk).await.is_err() {
-                        result = StreamEnd::PlayerClosed;
-                        break;
+                Ok(Some(chunk)) => match chunk {
+                    Chunk::Data(data) => {
+                        if player.write(&data).await.is_err() {
+                            result = StreamEnd::PlayerClosed;
+                            break;
+                        }
                     }
-                }
+                    Chunk::SegmentEnd { pdt_end_ms } => {
+                        let _ = segment_end_tx.send(pdt_end_ms);
+                    }
+                },
                 Ok(None) => {
                     tracing::info!("Stream ended");
                     break;
@@ -471,17 +548,26 @@ async fn run_stream(
 
     worker_task.abort();
     fetcher_task.abort();
-
-    match result {
+    let player_result = match result {
         StreamEnd::PlayerClosed => {
             tracing::info!("Player closed");
             let _ = player.child.kill().await;
+            Ok(())
         }
-        StreamEnd::Ended => {
-            player.finish().await?;
+        StreamEnd::Ended => player.finish().await,
+    };
+
+    if let Some((shutdown, mut task)) = replay_task {
+        let _ = shutdown.send(());
+        if tokio::time::timeout(Duration::from_secs(1), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
         }
     }
 
+    player_result?;
     Ok(result)
 }
 
@@ -518,7 +604,7 @@ async fn run_check(
         resp.status()
     );
     let content = resp.text().await?;
-    let playlist = crate::hls::m3u8::parse_media_playlist(&content, Some(&resolved.variant.uri));
+    let playlist = parse_media_playlist(&content, Some(&resolved.variant.uri));
     println!(
         "media playlist: {} segments (media_sequence={}, targetduration={:?}, prefetch={}, ads={})",
         playlist.segments.len(),
@@ -527,6 +613,17 @@ async fn run_check(
         playlist.segments.iter().filter(|s| s.prefetch).count(),
         playlist.segments.iter().filter(|s| s.ad).count(),
     );
+    match segment_cadence_seconds(&playlist) {
+        Some(seconds) => println!(
+            "segment cadence: {seconds:.3}s; mpv near-live low-latency profile: {}",
+            if seconds >= LONG_SEGMENT_CADENCE_SECONDS {
+                "disabled"
+            } else {
+                "enabled"
+            }
+        ),
+        None => println!("segment cadence: unknown (mpv profile unchanged)"),
+    }
     anyhow::ensure!(
         !playlist.segments.is_empty(),
         "media playlist contains no segments"
