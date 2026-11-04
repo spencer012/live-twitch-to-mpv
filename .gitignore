@@ -5,3 +5,6 @@ config.toml
 
 # Local run logs and scratch output.
 *.log
+
+# Locally built release binaries.
+/dist
