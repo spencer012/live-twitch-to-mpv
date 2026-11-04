@@ -15,17 +15,21 @@
 pub mod backup;
 pub mod delayed;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use async_trait::async_trait;
 
-use crate::hls::hook::{SegmentAction, SegmentHook};
-use crate::hls::m3u8::{MediaPlaylist, MediaSegment};
+use crate::hls::hook::{HookEvent, SegmentAction, SegmentHook, Substitute, ad_break_duration};
+use crate::hls::m3u8::{MediaPlaylist, MediaSegment, parse_media_playlist};
 use crate::twitch::api::TwitchApi;
 use crate::twitch::usher::UsherService;
 
 use backup::BackupStreamManager;
 use delayed::DelayedStreamManager;
+
+/// Strategy names reported through [`HookEvent`]s and [`Substitute`]s.
+pub const STRATEGY_DELAYED: &str = "delayed_playback";
+pub const STRATEGY_BACKUP: &str = "backup_player";
 
 pub struct TwitchAdBlock {
     delayed: DelayedStreamManager,
@@ -36,10 +40,15 @@ pub struct TwitchAdBlock {
     /// True while the backup strategy handles pre-roll ads.
     preroll_fallback: bool,
 
-    backup_segments: VecDeque<String>,
+    backup_segments: VecDeque<Substitute>,
     consumed_backup_urls: HashSet<String>,
 
     logged_ads: VecDeque<String>,
+
+    /// Reporting only: events since the last drain, and substitutes
+    /// supplied during the current ad episode.
+    events: Vec<HookEvent>,
+    substituted: usize,
 }
 
 impl TwitchAdBlock {
@@ -66,6 +75,8 @@ impl TwitchAdBlock {
             backup_segments: VecDeque::new(),
             consumed_backup_urls: HashSet::new(),
             logged_ads: VecDeque::new(),
+            events: Vec::new(),
+            substituted: 0,
         }
     }
 
@@ -110,6 +121,18 @@ impl TwitchAdBlock {
         };
         tracing::debug!("[AdBlock] Using backup playlist from {player_type}");
 
+        // Segment metadata for reporting (URL selection below is unchanged).
+        let metadata: HashMap<String, MediaSegment> = if content.starts_with("#EXTM3U") {
+            parse_media_playlist(&content, None)
+                .segments
+                .into_iter()
+                .filter(|s| !s.prefetch)
+                .map(|s| (s.uri.clone(), s))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // Extract segment URLs, skipping already-consumed ones so overlapping
         // reloads don't replay content.
         let mut segments = VecDeque::new();
@@ -126,7 +149,15 @@ impl TwitchAdBlock {
                 if self.consumed_backup_urls.contains(uri) {
                     skipped += 1;
                 } else {
-                    segments.push_back(uri.to_string());
+                    let meta = metadata.get(uri);
+                    segments.push_back(Substitute {
+                        url: uri.to_string(),
+                        strategy: STRATEGY_BACKUP,
+                        player_type: Some(player_type.clone()),
+                        sequence: meta.map(|m| m.num),
+                        date: meta.and_then(|m| m.date),
+                        duration: meta.map(|m| m.duration),
+                    });
                 }
             }
         }
@@ -142,10 +173,10 @@ impl TwitchAdBlock {
         self.backup_segments = segments;
     }
 
-    fn next_backup_url(&mut self) -> Option<String> {
-        let url = self.backup_segments.pop_front()?;
-        self.consumed_backup_urls.insert(url.clone());
-        Some(url)
+    fn next_backup_segment(&mut self) -> Option<Substitute> {
+        let segment = self.backup_segments.pop_front()?;
+        self.consumed_backup_urls.insert(segment.url.clone());
+        Some(segment)
     }
 }
 
@@ -167,6 +198,12 @@ impl SegmentHook for TwitchAdBlock {
                 self.is_showing_ad = true;
                 tracing::info!("[AdBlock] Ad break started");
 
+                // A new episode starts unless delayed playback is still
+                // catching up from the previous break (reporting only).
+                if !self.delayed.is_active() {
+                    self.substituted = 0;
+                }
+
                 // Pre-roll: ads before any real content has been seen. Delayed
                 // playback can't help (fresh tokens also get pre-rolls), so
                 // fall back to the backup player-type method.
@@ -179,6 +216,16 @@ impl SegmentHook for TwitchAdBlock {
                 } else {
                     self.delayed.on_ad_detected(current_sequence);
                 }
+                self.events.push(HookEvent::AdStart {
+                    strategy: if self.preroll_fallback {
+                        STRATEGY_BACKUP
+                    } else {
+                        STRATEGY_DELAYED
+                    },
+                    preroll: self.preroll_fallback,
+                    sequence: current_sequence,
+                    break_duration: ad_break_duration(playlist),
+                });
             }
 
             if self.preroll_fallback {
@@ -192,15 +239,22 @@ impl SegmentHook for TwitchAdBlock {
                 self.is_showing_ad = false;
                 tracing::info!("[AdBlock] Ad break ended");
 
-                if self.preroll_fallback {
+                let strategy = if self.preroll_fallback {
                     tracing::info!("[AdBlock] Pre-roll ads finished, switching to normal playback");
                     self.backup.on_ad_end();
                     self.backup_segments.clear();
                     self.consumed_backup_urls.clear();
                     self.preroll_fallback = false;
+                    STRATEGY_BACKUP
                 } else {
                     self.delayed.on_ads_ended(current_sequence);
-                }
+                    STRATEGY_DELAYED
+                };
+                self.events.push(HookEvent::AdEnd {
+                    strategy,
+                    sequence: current_sequence,
+                    catching_up: self.delayed.is_active(),
+                });
             }
 
             // Ads have ended at the live edge, but the delayed manager may
@@ -223,9 +277,24 @@ impl SegmentHook for TwitchAdBlock {
         // content; if none is available, skip the slot entirely — never mix
         // live ad content into delayed playback.
         if !self.preroll_fallback && self.delayed.is_active() {
-            if let Some((url, seq)) = self.delayed.next_segment().await {
-                tracing::debug!("[AdBlock] Substituting delayed segment seq={seq}");
-                return SegmentAction::Substitute(url);
+            if let Some(delayed) = self.delayed.next_segment().await {
+                tracing::debug!("[AdBlock] Substituting delayed segment seq={}", delayed.seq);
+                self.substituted += 1;
+                if !self.delayed.is_active() {
+                    self.events.push(HookEvent::AdCatchupComplete {
+                        strategy: STRATEGY_DELAYED,
+                        sequence: delayed.seq,
+                        substituted: std::mem::take(&mut self.substituted),
+                    });
+                }
+                return SegmentAction::Substitute(Substitute {
+                    url: delayed.url,
+                    strategy: STRATEGY_DELAYED,
+                    player_type: Some(delayed::FRESH_PLAYER_TYPE.to_string()),
+                    sequence: Some(delayed.seq),
+                    date: delayed.date,
+                    duration: Some(delayed.duration),
+                });
             }
             tracing::debug!(
                 "[AdBlock] No delayed segment available, skipping live segment (ad={})",
@@ -239,13 +308,18 @@ impl SegmentHook for TwitchAdBlock {
         }
 
         // Pre-roll fallback: replace ad segments with backup-stream segments.
-        if let Some(url) = self.next_backup_url() {
+        if let Some(substitute) = self.next_backup_segment() {
             self.backup.count_stripped();
+            self.substituted += 1;
             tracing::debug!("[AdBlock] Substituting backup segment");
-            return SegmentAction::Substitute(url);
+            return SegmentAction::Substitute(substitute);
         }
 
         tracing::debug!("[AdBlock] Backup segment unavailable, filtering ad segment");
         SegmentAction::Skip
+    }
+
+    fn drain_events(&mut self) -> Vec<HookEvent> {
+        std::mem::take(&mut self.events)
     }
 }

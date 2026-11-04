@@ -331,6 +331,41 @@ prefer_config = true
     }
 
     #[test]
+    fn example_config_parses_unchanged() {
+        let text = include_str!("../config.example.toml");
+        let config: Config = toml::from_str(text).unwrap();
+        assert!(config.twitch.low_latency);
+        assert_eq!(config.twitch.supported_codecs, vec!["av1", "h265", "h264"]);
+        assert!(config.twitch.ad_block);
+        assert_eq!(config.player.command, "mpv");
+        assert!(config.player.no_close);
+        assert!(config.player.include_channel_name);
+        assert!(!config.player.verbose);
+        assert_eq!(config.stream.ring_buffer_mb, 128);
+        assert_eq!(config.stream.live_edge, 1);
+        assert!(config.stream.live_restart);
+        assert!(config.stream.persist_stream);
+        assert_eq!(config.stream.recovery_timeout, 600.0);
+        assert_eq!(config.stream.segment_attempts, 10);
+        assert_eq!(config.stream.segment_threads, 2);
+        assert_eq!(config.stream.segment_timeout, 30.0);
+        assert_eq!(config.stream.stream_timeout, 600.0);
+        assert_eq!(config.retry.streams, 1.0);
+        assert_eq!(config.retry.max, 600);
+        assert_eq!(config.retry.open, 60);
+        assert_eq!(config.quality.priority.len(), 6);
+        assert!(!config.quality.prefer_config);
+        assert_eq!(config.log.level, "info");
+    }
+
+    #[test]
+    fn unknown_keys_are_still_rejected() {
+        // No new config keys were added for recorder mode.
+        assert!(toml::from_str::<Config>("[recorder]\noutput = \"x\"").is_err());
+        assert!(toml::from_str::<Config>("[stream]\noutput = \"x\"").is_err());
+    }
+
+    #[test]
     fn defaults_match_streamlink() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.stream.ring_buffer_mb, 16);

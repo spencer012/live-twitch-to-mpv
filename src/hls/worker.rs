@@ -4,7 +4,11 @@
 //! targetduration cadence, queues new segments in order for the fetcher, and
 //! implements the fork's persist/recovery behavior. Adblock is only touched
 //! through the `SegmentHook::on_playlist` call.
+//!
+//! With `WorkerConfig::events` set (recorder mode) it also reports recovery,
+//! sequence jumps and final timing of prefetch segments.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -12,6 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::hls::events::{self, EventTx, PipelineEvent};
 use crate::hls::hook::SegmentHook;
 use crate::hls::m3u8::{MediaSegment, parse_media_playlist};
 
@@ -20,6 +25,23 @@ const RELOAD_TIME_DEFAULT: f64 = 6.0;
 const RECOVERY_RETRY_INTERVAL: f64 = 10.0;
 const QUEUE_DEADLINE_FACTOR: f64 = 3.0;
 const QUEUE_DEADLINE_MIN: f64 = 5.0;
+/// Prefetch segments remembered for final-timing reports.
+const PREFETCH_TRACK_MAX: usize = 64;
+
+/// Why the worker stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkerExit {
+    /// The playlist had EXT-X-ENDLIST and every segment was queued.
+    Endlist,
+    /// No new segments within the deadline (persist_stream off).
+    NoNewSegments,
+    /// persist_stream recovery gave up after recovery_timeout.
+    RecoveryTimeout,
+    /// The initial playlist load failed.
+    LoadFailed(String),
+    /// The fetcher side went away.
+    OutputClosed,
+}
 
 pub struct WorkerConfig {
     pub low_latency: bool,
@@ -29,6 +51,8 @@ pub struct WorkerConfig {
     /// Seconds; 0 = wait forever.
     pub recovery_timeout: f64,
     pub reload_attempts: u32,
+    /// Recorder instrumentation; `None` = off.
+    pub events: Option<EventTx>,
 }
 
 /// Signals from the fetcher back to the worker (segment fetch failures
@@ -67,6 +91,8 @@ pub struct PlaylistWorker {
     /// Mark the next queued segment with a discontinuity after recovery.
     recovery_discontinuity: bool,
     low_latency_checked: bool,
+    /// Sequence numbers queued as prefetch segments (instrumentation only).
+    prefetch_queued: VecDeque<i64>,
 }
 
 impl PlaylistWorker {
@@ -93,6 +119,7 @@ impl PlaylistWorker {
             queue_last: Instant::now(),
             recovery_discontinuity: false,
             low_latency_checked: false,
+            prefetch_queued: VecDeque::new(),
         }
     }
 
@@ -152,12 +179,28 @@ impl PlaylistWorker {
         }
 
         // Adblock hook: drives the ad-block state machine (no-op by default).
-        self.hook.lock().await.on_playlist(&playlist).await;
+        {
+            let mut hook = self.hook.lock().await;
+            hook.on_playlist(&playlist).await;
+            for event in hook.drain_events() {
+                events::emit(&self.config.events, PipelineEvent::Hook(event));
+            }
+        }
 
-        // Zero ad segment durations so they don't skew reload timing.
-        for segment in &mut playlist.segments {
-            if segment.ad {
-                segment.duration = 0.0;
+        // Final playlist timing for segments we queued as prefetch.
+        if self.config.events.is_some() && !self.prefetch_queued.is_empty() {
+            for segment in playlist.segments.iter().filter(|s| !s.prefetch) {
+                if let Some(pos) = self.prefetch_queued.iter().position(|n| *n == segment.num) {
+                    self.prefetch_queued.remove(pos);
+                    events::emit(
+                        &self.config.events,
+                        PipelineEvent::SegmentTiming {
+                            sequence: segment.num,
+                            date: segment.date,
+                            duration: segment.duration,
+                        },
+                    );
+                }
             }
         }
 
@@ -173,11 +216,12 @@ impl PlaylistWorker {
 
         // Reload time: last segment duration in LL mode, else targetduration,
         // else keep the current value; halve (floor 1s) when unchanged.
+        // Ad segment durations count as zero so they don't skew reload timing.
         let new_reload_time = if self.config.low_latency {
             playlist
                 .segments
                 .last()
-                .map(|s| s.duration)
+                .map(|s| if s.ad { 0.0 } else { s.duration })
                 .filter(|d| *d > 0.0)
         } else {
             None
@@ -226,8 +270,15 @@ impl PlaylistWorker {
 
     /// Poll the playlist until segments at/after the current sequence appear,
     /// every 10s, up to recovery_timeout (0 = forever).
-    async fn recover_stream(&mut self) -> bool {
+    async fn recover_stream(&mut self, reason: &str) -> bool {
         tracing::info!("[persist] Stream appears offline, waiting for recovery...");
+        events::emit(
+            &self.config.events,
+            PipelineEvent::StreamDown {
+                reason: reason.to_string(),
+                last_sequence: self.sequence - 1,
+            },
+        );
         let started = Instant::now();
         let mut attempt = 0u64;
 
@@ -259,6 +310,13 @@ impl PlaylistWorker {
                             segments.len()
                         );
                         self.recovery_discontinuity = true;
+                        events::emit(
+                            &self.config.events,
+                            PipelineEvent::StreamRecovered {
+                                downtime_s: started.elapsed().as_secs_f64(),
+                                sequence: segments[0].num,
+                            },
+                        );
                         return true;
                     }
                     tracing::debug!("[persist] No new segments yet, continuing to wait...");
@@ -270,6 +328,12 @@ impl PlaylistWorker {
         }
 
         tracing::warn!("[persist] Stream recovery timed out");
+        events::emit(
+            &self.config.events,
+            PipelineEvent::RecoveryTimedOut {
+                waited_s: started.elapsed().as_secs_f64(),
+            },
+        );
         false
     }
 
@@ -286,6 +350,7 @@ impl PlaylistWorker {
             if segment.num < self.sequence {
                 continue;
             }
+            let after_recovery = self.recovery_discontinuity;
             if self.recovery_discontinuity {
                 segment.discontinuity = true;
                 self.recovery_discontinuity = false;
@@ -299,6 +364,20 @@ impl PlaylistWorker {
                     num - self.sequence,
                     self.sequence
                 );
+                events::emit(
+                    &self.config.events,
+                    PipelineEvent::SequenceJump {
+                        from: self.sequence,
+                        to: num - 1,
+                        after_recovery,
+                    },
+                );
+            }
+            if segment.prefetch && self.config.events.is_some() {
+                self.prefetch_queued.push_back(num);
+                while self.prefetch_queued.len() > PREFETCH_TRACK_MAX {
+                    self.prefetch_queued.pop_front();
+                }
             }
             tracing::debug!(
                 "Queuing segment {num} (duration={:.3}, title={:?}, ad={}, prefetch={})",
@@ -316,7 +395,16 @@ impl PlaylistWorker {
         Some(queued)
     }
 
-    pub async fn run(mut self) {
+    /// recover_stream() returned false: timed out, or the receiver is gone.
+    fn recovery_failed_exit(&self) -> WorkerExit {
+        if self.tx.is_closed() {
+            WorkerExit::OutputClosed
+        } else {
+            WorkerExit::RecoveryTimeout
+        }
+    }
+
+    pub async fn run(mut self) -> WorkerExit {
         let mut reload_last = Instant::now();
 
         // Initial load.
@@ -324,12 +412,12 @@ impl PlaylistWorker {
             Ok(segments) => segments,
             Err(err) => {
                 tracing::error!("Failed to load playlist: {err:#}");
-                return;
+                return WorkerExit::LoadFailed(events::redact_urls(&format!("{err:#}")));
             }
         };
         self.queue_last = Instant::now();
         let Some(mut queued) = self.queue_segments(segments).await else {
-            return;
+            return WorkerExit::OutputClosed;
         };
         if queued {
             self.queue_last = Instant::now();
@@ -339,11 +427,11 @@ impl PlaylistWorker {
             // Recovery requested by the fetcher (segment failures)?
             let fetch_recovery = self.recovery.take();
             if fetch_recovery && self.config.persist_stream {
-                if self.recover_stream().await {
+                if self.recover_stream("segment_fetch_failed").await {
                     self.queue_last = Instant::now();
                     tracing::info!("Stream recovered, resuming...");
                 } else {
-                    return;
+                    return self.recovery_failed_exit();
                 }
             }
 
@@ -352,7 +440,7 @@ impl PlaylistWorker {
                 && self.sequence > end
             {
                 tracing::debug!("Reached playlist end");
-                return;
+                return WorkerExit::Endlist;
             }
 
             // Implicit end of stream: no new segments within the deadline.
@@ -362,15 +450,15 @@ impl PlaylistWorker {
                     self.queue_deadline()
                 );
                 if self.config.persist_stream {
-                    if self.recover_stream().await {
+                    if self.recover_stream("no_new_segments").await {
                         self.queue_last = Instant::now();
                         tracing::info!("Stream recovered, resuming...");
                     } else {
-                        return;
+                        return self.recovery_failed_exit();
                     }
                 } else {
                     tracing::warn!("Stopping stream...");
-                    return;
+                    return WorkerExit::NoNewSegments;
                 }
             }
 
@@ -383,7 +471,7 @@ impl PlaylistWorker {
             reload_last = Instant::now();
 
             if self.tx.is_closed() {
-                return;
+                return WorkerExit::OutputClosed;
             }
 
             match self.reload().await {
@@ -398,13 +486,20 @@ impl PlaylistWorker {
                         {
                             let _ = end;
                             tracing::debug!("Reached playlist end without new segments");
-                            return;
+                            return WorkerExit::Endlist;
                         }
                     }
-                    None => return,
+                    None => return WorkerExit::OutputClosed,
                 },
                 Err(err) => {
                     tracing::warn!("Reloading failed: {err:#}");
+                    events::emit(
+                        &self.config.events,
+                        PipelineEvent::Warning(format!(
+                            "playlist reload failed: {}",
+                            events::redact_urls(&format!("{err:#}"))
+                        )),
+                    );
                     queued = false;
                 }
             }

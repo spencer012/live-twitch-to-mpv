@@ -79,6 +79,7 @@ mod tests {
             bandwidth: bw,
             resolution: res,
             framerate: fps,
+            codecs: None,
         }
     }
 

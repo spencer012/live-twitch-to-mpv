@@ -3,6 +3,9 @@
 //! The hook is consulted sequentially (in queue order) so segment
 //! substitution is deterministic; downloads then run concurrently via
 //! spawned tasks, while response bodies are drained in queue order.
+//!
+//! With `FetcherConfig::events` set (recorder mode), every slot is also
+//! reported in write-out order via in-band [`SlotMarker`]s.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +15,8 @@ use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::buffer::ByteSender;
-use crate::hls::hook::{SegmentAction, SegmentHook};
+use crate::hls::events::{self, EventTx, PipelineEvent, SlotInfo, SlotMarker};
+use crate::hls::hook::{SegmentAction, SegmentHook, Substitute};
 use crate::hls::m3u8::MediaSegment;
 use crate::hls::worker::RecoveryRequest;
 
@@ -24,6 +28,8 @@ pub struct FetcherConfig {
     /// Per-attempt timeout in seconds.
     pub timeout: f64,
     pub persist_stream: bool,
+    /// Recorder instrumentation (markers + hook events); `None` = off.
+    pub events: Option<EventTx>,
 }
 
 pub struct SegmentFetcher {
@@ -37,10 +43,10 @@ enum FetchOutcome {
     Response {
         segment: MediaSegment,
         response: reqwest::Response,
-        is_substitute: bool,
+        substitute: Option<Substitute>,
     },
-    Skipped,
-    Failed(MediaSegment, anyhow::Error),
+    Skipped(MediaSegment),
+    Failed(MediaSegment, anyhow::Error, Option<Substitute>),
 }
 
 impl SegmentFetcher {
@@ -102,7 +108,14 @@ impl SegmentFetcher {
             let semaphore = semaphore.clone();
             tokio::spawn(async move {
                 while let Some(segment) = rx.recv().await {
-                    let action = this.hook.lock().await.segment_action(&segment).await;
+                    let action = {
+                        let mut hook = this.hook.lock().await;
+                        let action = hook.segment_action(&segment).await;
+                        for event in hook.drain_events() {
+                            events::emit(&this.config.events, PipelineEvent::Hook(event));
+                        }
+                        action
+                    };
                     let handle = {
                         let this = this.clone();
                         let semaphore = semaphore.clone();
@@ -119,6 +132,12 @@ impl SegmentFetcher {
         };
 
         // Stage 2 (ordered write-out): await downloads in submission order.
+        let markers = this.config.events.is_some();
+        let marker = |m: SlotMarker| {
+            if markers {
+                let _ = out.marker(m);
+            }
+        };
         let mut fetch_rx = fetch_rx;
         let mut wrote_discontinuity_warning = false;
         while let Some(handle) = fetch_rx.recv().await {
@@ -129,18 +148,25 @@ impl SegmentFetcher {
                 FetchOutcome::Response {
                     segment,
                     response,
-                    is_substitute,
+                    substitute,
                 } => {
+                    marker(SlotMarker::Begin(SlotInfo::new(
+                        &segment,
+                        substitute.as_ref(),
+                    )));
                     match this
-                        .stream_response(&out, &segment, response, is_substitute)
+                        .stream_response(&out, &segment, response, substitute.is_some())
                         .await
                     {
-                        Ok(StreamWrite::Complete) => {}
+                        Ok(StreamWrite::Complete) => marker(SlotMarker::End { error: None }),
                         Ok(StreamWrite::OutputClosed) => {
                             tracing::debug!("Output closed, stopping fetcher");
                             break;
                         }
                         Err(err) => {
+                            marker(SlotMarker::End {
+                                error: Some(events::redact_urls(&format!("{err:#}"))),
+                            });
                             tracing::error!("Failed to download segment {}: {err:#}", segment.num);
                             if this.config.persist_stream {
                                 this.recovery.request(&format!(
@@ -157,8 +183,14 @@ impl SegmentFetcher {
                         }
                     }
                 }
-                FetchOutcome::Skipped => {}
-                FetchOutcome::Failed(segment, err) => {
+                FetchOutcome::Skipped(segment) => {
+                    marker(SlotMarker::Skipped(SlotInfo::new(&segment, None)));
+                }
+                FetchOutcome::Failed(segment, err, substitute) => {
+                    marker(SlotMarker::Failed(
+                        SlotInfo::new(&segment, substitute.as_ref()),
+                        events::redact_urls(&format!("{err:#}")),
+                    ));
                     tracing::error!("Failed to fetch segment {}: {err:#}", segment.num);
                     if this.config.persist_stream {
                         this.recovery
@@ -206,21 +238,21 @@ impl SegmentFetcher {
     }
 
     async fn fetch_segment(&self, segment: MediaSegment, action: SegmentAction) -> FetchOutcome {
-        let (url, is_substitute) = match action {
-            SegmentAction::Fetch => (segment.uri.clone(), false),
-            SegmentAction::Substitute(url) => (url, true),
+        let (url, substitute) = match action {
+            SegmentAction::Fetch => (segment.uri.clone(), None),
+            SegmentAction::Substitute(substitute) => (substitute.url.clone(), Some(substitute)),
             SegmentAction::Skip => {
                 tracing::debug!("Discarding segment {}", segment.num);
-                return FetchOutcome::Skipped;
+                return FetchOutcome::Skipped(segment);
             }
         };
         match self.fetch_url(&url).await {
             Ok(response) => FetchOutcome::Response {
                 segment,
                 response,
-                is_substitute,
+                substitute,
             },
-            Err(err) => FetchOutcome::Failed(segment, err),
+            Err(err) => FetchOutcome::Failed(segment, err, substitute),
         }
     }
 }

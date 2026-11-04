@@ -72,6 +72,8 @@ pub struct VariantStream {
     pub bandwidth: u64,
     pub resolution: Option<(u32, u32)>,
     pub framerate: Option<f64>,
+    /// CODECS attribute, e.g. "avc1.64002A,mp4a.40.2".
+    pub codecs: Option<String>,
 }
 
 impl VariantStream {
@@ -445,6 +447,7 @@ pub fn parse_multivariant_playlist(content: &str, base_uri: Option<&str>) -> Mul
                     bandwidth,
                     resolution,
                     framerate,
+                    codecs: attrs.get("CODECS").cloned(),
                 });
             }
         }
@@ -705,6 +708,11 @@ mod tests {
         assert_eq!(playlist.variants[0].name, "1080p60 (source)");
         assert_eq!(playlist.variants[0].normalized_name(), "1080p60");
         assert_eq!(playlist.variants[0].resolution, Some((1920, 1080)));
+        assert_eq!(
+            playlist.variants[0].codecs.as_deref(),
+            Some("avc1.64002A,mp4a.40.2")
+        );
+        assert_eq!(playlist.variants[1].codecs, None);
         assert_eq!(playlist.variants[1].name, "720p60");
         assert_eq!(playlist.variants[2].name, "audio_only");
         assert_eq!(playlist.variants[2].pixels(), 0);

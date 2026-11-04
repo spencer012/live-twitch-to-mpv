@@ -2,8 +2,10 @@ mod adblock;
 mod buffer;
 mod config;
 mod hls;
+mod overrides;
 mod player;
 mod quality;
+mod recorder;
 mod twitch;
 
 use std::path::PathBuf;
@@ -15,14 +17,18 @@ use clap::Parser;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::adblock::TwitchAdBlock;
+use crate::buffer::ByteReceiver;
 use crate::buffer::byte_channel;
 use crate::config::Config;
+use crate::hls::events::EventTx;
 use crate::hls::fetch::{FetcherConfig, SegmentFetcher};
 use crate::hls::hook::{AdFilterHook, SegmentHook};
 use crate::hls::m3u8::{VariantStream, parse_multivariant_playlist};
-use crate::hls::worker::{PlaylistWorker, RecoveryRequest, WorkerConfig};
+use crate::hls::worker::{PlaylistWorker, RecoveryRequest, WorkerConfig, WorkerExit};
+use crate::overrides::Overrides;
 use crate::player::Player;
 use crate::quality::select_variant;
+use crate::recorder::RecordArgs;
 use crate::twitch::api::{TokenResult, TwitchApi};
 use crate::twitch::usher::{PLAYER_REFERER, UsherService};
 
@@ -53,6 +59,27 @@ struct Cli {
     /// Override the log level from the config (trace|debug|info|warn|error)
     #[arg(long)]
     log_level: Option<String>,
+
+    #[command(flatten)]
+    record: RecordArgs,
+
+    #[command(flatten)]
+    overrides: Overrides,
+}
+
+/// Start-up failures that recorder mode maps to distinct exit codes. The
+/// messages are the same ones player mode has always printed.
+#[derive(Debug, thiserror::Error)]
+enum StartError {
+    /// No playable stream (channel offline or nonexistent).
+    #[error("{0}")]
+    Offline(String),
+    /// Twitch refused the access token request.
+    #[error("{0}")]
+    Auth(String),
+    /// No variant matched the quality priority list.
+    #[error("{0}")]
+    NoQuality(String),
 }
 
 fn parse_channel(input: &str) -> Result<String> {
@@ -135,10 +162,11 @@ async fn resolve_stream(
         }
         TokenResult::Error(message) => {
             // No client-integrity browser flow in this port: report clearly.
-            bail!(
+            return Err(StartError::Auth(format!(
                 "Twitch API error while fetching the access token: {message}\n\
                  (client-integrity token acquisition is not supported by TwitchPipe)"
-            );
+            ))
+            .into());
         }
     };
 
@@ -149,6 +177,9 @@ async fn resolve_stream(
         .timeout(Duration::from_secs(10))
         .send()
         .await
+        // The usher URL carries the playback access token: keep it out of
+        // error messages.
+        .map_err(reqwest::Error::without_url)
         .context("usher request failed")?;
     if !resp.status().is_success() {
         tracing::debug!("Usher returned status {}: stream offline", resp.status());
@@ -176,11 +207,12 @@ async fn resolve_stream(
     };
 
     let Some(variant) = select_variant(&multivariant.variants, &priority) else {
-        bail!(
+        return Err(StartError::NoQuality(format!(
             "no stream matched the quality priority list {:?}; available: {}",
             priority,
             names.join(", ")
-        );
+        ))
+        .into());
     };
     tracing::info!("Selected stream quality: {}", variant.name);
 
@@ -206,10 +238,16 @@ async fn wait_for_stream(
             Some(resolved) => return Ok(resolved),
             None => {
                 if config.retry.streams <= 0.0 {
-                    bail!("no playable streams found on channel {channel}");
+                    return Err(StartError::Offline(format!(
+                        "no playable streams found on channel {channel}"
+                    ))
+                    .into());
                 }
                 if config.retry.max > 0 && polls >= config.retry.max {
-                    bail!("no playable streams found on channel {channel} after {polls} attempts");
+                    return Err(StartError::Offline(format!(
+                        "no playable streams found on channel {channel} after {polls} attempts"
+                    ))
+                    .into());
                 }
                 if polls == 1 {
                     tracing::info!(
@@ -230,29 +268,45 @@ enum StreamEnd {
     PlayerClosed,
 }
 
-/// Run the full pipeline for one stream: worker -> fetcher -> buffer -> player.
-async fn run_stream(
+/// The ad hook for this stream: the adblock module or the plain ad filter.
+fn build_hook(
     client: &reqwest::Client,
     api: &TwitchApi,
     usher: &UsherService,
     config: &Config,
     channel: &str,
-    resolved: &ResolvedStream,
-    title: Option<&str>,
-) -> Result<StreamEnd> {
-    let hook: Arc<Mutex<dyn SegmentHook>> = if config.twitch.ad_block {
+    variant: &VariantStream,
+) -> Arc<Mutex<dyn SegmentHook>> {
+    if config.twitch.ad_block {
         Arc::new(Mutex::new(TwitchAdBlock::new(
             client.clone(),
             api.clone(),
             usher.clone(),
             channel,
-            resolved.variant.resolution,
+            variant.resolution,
         )))
     } else {
         tracing::info!("Will skip ad segments");
-        Arc::new(Mutex::new(AdFilterHook))
-    };
+        Arc::new(Mutex::new(AdFilterHook::default()))
+    }
+}
 
+/// Running worker + fetcher feeding the byte buffer.
+struct Pipeline {
+    worker: tokio::task::JoinHandle<WorkerExit>,
+    fetcher: tokio::task::JoinHandle<()>,
+    bytes: ByteReceiver,
+}
+
+/// Start the worker -> fetcher -> buffer pipeline for one media playlist.
+/// `events` enables recorder instrumentation (player mode passes `None`).
+fn spawn_pipeline(
+    client: &reqwest::Client,
+    playlist_url: &str,
+    config: &Config,
+    hook: Arc<Mutex<dyn SegmentHook>>,
+    events: Option<EventTx>,
+) -> Pipeline {
     if config.twitch.low_latency {
         let edge = config
             .stream
@@ -263,11 +317,11 @@ async fn run_stream(
 
     let recovery = RecoveryRequest::default();
     let (segment_tx, segment_rx) = mpsc::channel(20);
-    let (byte_tx, mut byte_rx) = byte_channel(config.stream.ring_buffer_mb as usize * 1024 * 1024);
+    let (byte_tx, byte_rx) = byte_channel(config.stream.ring_buffer_mb as usize * 1024 * 1024);
 
     let worker = PlaylistWorker::new(
         client.clone(),
-        resolved.variant.uri.clone(),
+        playlist_url.to_string(),
         WorkerConfig {
             low_latency: config.twitch.low_latency,
             live_edge: config.stream.live_edge,
@@ -275,6 +329,7 @@ async fn run_stream(
             persist_stream: config.stream.persist_stream,
             recovery_timeout: config.stream.recovery_timeout,
             reload_attempts: config.stream.segment_attempts,
+            events: events.clone(),
         },
         hook.clone(),
         segment_tx,
@@ -288,13 +343,35 @@ async fn run_stream(
             attempts: config.stream.segment_attempts,
             timeout: config.stream.segment_timeout,
             persist_stream: config.stream.persist_stream,
+            events,
         },
         hook,
         recovery,
     );
 
-    let worker_task = tokio::spawn(worker.run());
-    let fetcher_task = tokio::spawn(fetcher.run(segment_rx, byte_tx));
+    Pipeline {
+        worker: tokio::spawn(worker.run()),
+        fetcher: tokio::spawn(fetcher.run(segment_rx, byte_tx)),
+        bytes: byte_rx,
+    }
+}
+
+/// Run the full pipeline for one stream: worker -> fetcher -> buffer -> player.
+async fn run_stream(
+    client: &reqwest::Client,
+    api: &TwitchApi,
+    usher: &UsherService,
+    config: &Config,
+    channel: &str,
+    resolved: &ResolvedStream,
+    title: Option<&str>,
+) -> Result<StreamEnd> {
+    let hook = build_hook(client, api, usher, config, channel, &resolved.variant);
+    let Pipeline {
+        worker: worker_task,
+        fetcher: fetcher_task,
+        bytes: mut byte_rx,
+    } = spawn_pipeline(client, &resolved.variant.uri, config, hook, None);
 
     // A read timeout aborts the stream like streamlink's --stream-timeout.
     let stream_timeout = Duration::from_secs_f64(config.stream.stream_timeout.max(1.0));
@@ -446,7 +523,12 @@ async fn run_check(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(cli.config.as_deref())?;
+    if cli.record.record {
+        // Headless recorder: never touches the player path below.
+        std::process::exit(recorder::run(cli).await);
+    }
+    let mut config = Config::load(cli.config.as_deref())?;
+    cli.overrides.apply(&mut config)?;
     let level = cli.log_level.as_deref().unwrap_or(&config.log.level);
     init_logging(level);
 
@@ -520,4 +602,122 @@ async fn main() -> Result<()> {
         }
     }
     Err(last_err.expect("at least one attempt was made"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("twitchpipe").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn plain_invocations_select_player_mode() {
+        for args in [
+            &["some_channel"][..],
+            &["some_channel", "720p60"],
+            &["https://twitch.tv/some_channel", "best"],
+            &["--config", "my.toml", "some_channel"],
+            &["--log-level", "debug", "some_channel", "720p"],
+            &["--check", "some_channel"],
+            // a channel literally named "record" is still just a channel
+            &["record"],
+            &["record", "720p"],
+        ] {
+            let cli = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(!cli.record.record, "{args:?} must not select recorder mode");
+            assert_eq!(cli.record, RecordArgs::default(), "{args:?}");
+            assert_eq!(cli.overrides, Overrides::default(), "{args:?}");
+        }
+        let cli = parse(&["--config", "c.toml", "chan", "720p60"]).unwrap();
+        assert_eq!(cli.channel, "chan");
+        assert_eq!(cli.quality.as_deref(), Some("720p60"));
+        assert_eq!(cli.config, Some(PathBuf::from("c.toml")));
+        assert!(!cli.check);
+        assert_eq!(parse_channel("record").unwrap(), "record");
+    }
+
+    #[test]
+    fn recorder_flags_require_record() {
+        assert!(parse(&["--output", "out.ts", "chan"]).is_err());
+        assert!(parse(&["--events", "-", "chan"]).is_err());
+        assert!(parse(&["--append", "chan"]).is_err());
+        assert!(parse(&[]).is_err(), "channel is still required");
+    }
+
+    #[test]
+    fn parses_recorder_invocation() {
+        let cli = parse(&[
+            "--record",
+            "--output",
+            "/rec/001.ts",
+            "--events",
+            "/rec/001.jsonl",
+            "--config",
+            "c.toml",
+            "--oauth-token-file",
+            "/run/secrets/token",
+            "--live-edge",
+            "6",
+            "--no-low-latency",
+            "--ad-block",
+            "--persist",
+            "--recovery-timeout",
+            "120",
+            "--segment-threads",
+            "2",
+            "--segment-attempts",
+            "10",
+            "--segment-timeout",
+            "15",
+            "--stream-timeout",
+            "90",
+            "--retry-open",
+            "3",
+            "https://www.twitch.tv/Some_Channel",
+            "best",
+        ])
+        .unwrap();
+        assert!(cli.record.record);
+        assert_eq!(cli.record.output, Some(PathBuf::from("/rec/001.ts")));
+        assert_eq!(cli.record.events, Some(PathBuf::from("/rec/001.jsonl")));
+        assert!(!cli.record.append);
+        assert_eq!(cli.quality.as_deref(), Some("best"));
+        assert_eq!(parse_channel(&cli.channel).unwrap(), "some_channel");
+        let o = &cli.overrides;
+        assert_eq!(
+            o.oauth_token_file,
+            Some(PathBuf::from("/run/secrets/token"))
+        );
+        assert_eq!(o.live_edge, Some(6));
+        assert!(o.no_low_latency && !o.low_latency);
+        assert!(o.ad_block && !o.no_ad_block);
+        assert!(o.persist);
+        assert_eq!(o.recovery_timeout, Some(120.0));
+        assert_eq!(o.segment_threads, Some(2));
+        assert_eq!(o.segment_attempts, Some(10));
+        assert_eq!(o.segment_timeout, Some(15.0));
+        assert_eq!(o.stream_timeout, Some(90.0));
+        assert_eq!(o.retry_open, Some(3));
+
+        let cli = parse(&["--record", "--output", "-", "--append", "chan"]).unwrap();
+        assert_eq!(cli.record.output, Some(PathBuf::from("-")));
+        assert!(cli.record.append);
+    }
+
+    #[test]
+    fn last_toggle_wins() {
+        let cli = parse(&["--ad-block", "--no-ad-block", "chan"]).unwrap();
+        assert!(!cli.overrides.ad_block && cli.overrides.no_ad_block);
+        let cli = parse(&["--no-low-latency", "--low-latency", "chan"]).unwrap();
+        assert!(cli.overrides.low_latency && !cli.overrides.no_low_latency);
+    }
+
+    #[test]
+    fn start_errors_keep_their_messages() {
+        let err: anyhow::Error = StartError::Offline("no playable streams found".into()).into();
+        assert_eq!(err.to_string(), "no playable streams found");
+        assert_eq!(format!("{err:#}"), "no playable streams found");
+    }
 }

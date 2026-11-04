@@ -11,6 +11,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, FixedOffset};
+
 use crate::hls::m3u8::{parse_media_playlist, parse_multivariant_playlist};
 use crate::twitch::api::{TokenResult, TwitchApi};
 use crate::twitch::usher::UsherService;
@@ -20,6 +22,17 @@ const FETCH_INTERVAL_DELAYED: Duration = Duration::from_secs(8);
 const FETCH_INTERVAL_CATCHUP: Duration = Duration::from_secs(4);
 const MIN_REMAINING_BEFORE_FETCH: usize = 5;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Player type of the fresh tokens used for delayed playlists.
+pub const FRESH_PLAYER_TYPE: &str = "popout";
+
+/// A queued ad-free segment from a fresh (delayed) playlist.
+#[derive(Debug, Clone)]
+pub struct DelayedSegment {
+    pub url: String,
+    pub seq: i64,
+    pub date: Option<DateTime<FixedOffset>>,
+    pub duration: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -53,8 +66,8 @@ pub struct DelayedStreamManager {
     min_delayed_sequence: Option<i64>,
     last_live_sequence: Option<i64>,
 
-    /// Queued (url, sequence) pairs, deduplicated by sequence number.
-    delayed_segments: Vec<(String, i64)>,
+    /// Queued segments, deduplicated by sequence number.
+    delayed_segments: Vec<DelayedSegment>,
     delayed_index: usize,
     consumed_sequences: HashSet<i64>,
     known_sequences: HashSet<i64>,
@@ -226,7 +239,12 @@ impl DelayedStreamManager {
                 continue;
             }
             self.known_sequences.insert(segment.num);
-            new_segments.push((segment.uri.clone(), segment.num));
+            new_segments.push(DelayedSegment {
+                url: segment.uri.clone(),
+                seq: segment.num,
+                date: segment.date,
+                duration: segment.duration,
+            });
         }
 
         if new_segments.is_empty() {
@@ -239,8 +257,8 @@ impl DelayedStreamManager {
             return self.remaining() > 0;
         }
 
-        let first = new_segments.first().map(|(_, n)| *n).unwrap_or(0);
-        let last = new_segments.last().map(|(_, n)| *n).unwrap_or(0);
+        let first = new_segments.first().map(|s| s.seq).unwrap_or(0);
+        let last = new_segments.last().map(|s| s.seq).unwrap_or(0);
         tracing::info!(
             "[AdBlock] Found {} new delayed segments (seq {first}-{last}), {skipped_too_old} skipped",
             new_segments.len()
@@ -250,7 +268,7 @@ impl DelayedStreamManager {
     }
 
     /// Pop the next delayed segment; refetches when the queue runs dry.
-    pub async fn next_segment(&mut self) -> Option<(String, i64)> {
+    pub async fn next_segment(&mut self) -> Option<DelayedSegment> {
         if self.state == State::Normal {
             return None;
         }
@@ -260,7 +278,8 @@ impl DelayedStreamManager {
             self.try_get_delayed_segments().await;
         }
 
-        let (url, seq) = self.delayed_segments.get(self.delayed_index)?.clone();
+        let segment = self.delayed_segments.get(self.delayed_index)?.clone();
+        let seq = segment.seq;
         self.delayed_index += 1;
         self.consumed_sequences.insert(seq);
         self.segments_recovered += 1;
@@ -288,7 +307,7 @@ impl DelayedStreamManager {
             );
         }
 
-        Some((url, seq))
+        Some(segment)
     }
 
     fn reset_for_next_ad_break(&mut self) {
@@ -305,7 +324,11 @@ impl DelayedStreamManager {
     /// Fetch a fresh token (popout/web), the usher multivariant playlist and
     /// finally the media playlist matching our resolution.
     async fn fetch_fresh_playlist(&self) -> Option<String> {
-        let token = match self.api.access_token(&self.channel, "popout", "web").await {
+        let token = match self
+            .api
+            .access_token(&self.channel, FRESH_PLAYER_TYPE, "web")
+            .await
+        {
             Ok(TokenResult::Token(token)) => token,
             Ok(other) => {
                 tracing::debug!("[AdBlock] Fresh token request failed: {other:?}");
@@ -376,6 +399,7 @@ mod tests {
             bandwidth: 0,
             resolution: res,
             framerate: None,
+            codecs: None,
         }
     }
 
