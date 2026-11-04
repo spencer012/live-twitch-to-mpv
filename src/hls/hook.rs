@@ -20,6 +20,9 @@ pub enum SegmentAction {
     Skip,
 }
 
+// async-trait expands to boxed futures that carry `#[must_use]`; newer
+// clippy flags that as a double must-use on the generated methods.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait SegmentHook: Send {
     /// Called by the worker after every playlist reload, before queueing.

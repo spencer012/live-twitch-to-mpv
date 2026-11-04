@@ -174,7 +174,11 @@ impl PlaylistWorker {
         // Reload time: last segment duration in LL mode, else targetduration,
         // else keep the current value; halve (floor 1s) when unchanged.
         let new_reload_time = if self.config.low_latency {
-            playlist.segments.last().map(|s| s.duration).filter(|d| *d > 0.0)
+            playlist
+                .segments
+                .last()
+                .map(|s| s.duration)
+                .filter(|d| *d > 0.0)
         } else {
             None
         }

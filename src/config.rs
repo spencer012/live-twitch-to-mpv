@@ -190,7 +190,9 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: d_loglevel() }
+        Self {
+            level: d_loglevel(),
+        }
     }
 }
 

@@ -152,10 +152,7 @@ impl TwitchApi {
 
 fn parse_token_response(value: &Value) -> TokenResult {
     // {"errors": [{"message": ...}]}
-    if let Some(message) = value
-        .pointer("/errors/0/message")
-        .and_then(Value::as_str)
-    {
+    if let Some(message) = value.pointer("/errors/0/message").and_then(Value::as_str) {
         return TokenResult::Error(message.to_string());
     }
     // {"error": ..., "message": ...}

@@ -149,7 +149,10 @@ impl DelayedStreamManager {
                 self.transition_to(State::CatchingUp);
             }
             State::CatchingUp => {
-                if self.catchup_target_sequence.is_none_or(|t| current_sequence > t) {
+                if self
+                    .catchup_target_sequence
+                    .is_none_or(|t| current_sequence > t)
+                {
                     self.catchup_target_sequence = Some(current_sequence);
                 }
             }
@@ -169,7 +172,9 @@ impl DelayedStreamManager {
     }
 
     fn remaining(&self) -> usize {
-        self.delayed_segments.len().saturating_sub(self.delayed_index)
+        self.delayed_segments
+            .len()
+            .saturating_sub(self.delayed_index)
     }
 
     /// Fetch more delayed segments if the rate limiter and queue level allow.
@@ -184,9 +189,7 @@ impl DelayedStreamManager {
             _ => (FETCH_INTERVAL_DELAYED, MIN_REMAINING_BEFORE_FETCH),
         };
 
-        let elapsed_ok = self
-            .last_fetch
-            .is_none_or(|t| t.elapsed() >= min_interval);
+        let elapsed_ok = self.last_fetch.is_none_or(|t| t.elapsed() >= min_interval);
         let remaining = self.remaining();
         if !elapsed_ok && remaining >= min_remaining {
             return remaining > 0;
@@ -210,7 +213,10 @@ impl DelayedStreamManager {
             if segment.ad || segment.prefetch {
                 continue;
             }
-            if self.min_delayed_sequence.is_some_and(|min| segment.num < min) {
+            if self
+                .min_delayed_sequence
+                .is_some_and(|min| segment.num < min)
+            {
                 skipped_too_old += 1;
                 continue;
             }

@@ -98,12 +98,7 @@ mod tests {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        let get = |key: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        };
+        let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         assert_eq!(get("platform").as_deref(), Some("web"));
         assert_eq!(get("fast_bread").as_deref(), Some("true"));
         assert_eq!(get("supported_codecs").as_deref(), Some("av1,h265,h264"));

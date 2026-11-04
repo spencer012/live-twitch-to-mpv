@@ -18,7 +18,11 @@ const STICKY_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn platform_for(player_type: &str) -> &'static str {
-    if player_type == "autoplay" { "android" } else { "web" }
+    if player_type == "autoplay" {
+        "android"
+    } else {
+        "web"
+    }
 }
 
 fn has_ads(content: &str) -> bool {
@@ -49,13 +53,12 @@ impl RateLimiter {
     }
 
     fn mark_requested(&mut self, player_type: &str) {
-        self.last_request.insert(player_type.to_string(), Instant::now());
+        self.last_request
+            .insert(player_type.to_string(), Instant::now());
     }
 
     fn mark_failed(&mut self, player_type: &str) {
-        tracing::debug!(
-            "[AdBlock] {player_type} marked as failed, will not retry this session"
-        );
+        tracing::debug!("[AdBlock] {player_type} marked as failed, will not retry this session");
         self.failed.insert(player_type.to_string());
     }
 
@@ -154,7 +157,9 @@ impl BackupStreamManager {
                 None
             }
             Err(err) => {
-                tracing::debug!("[AdBlock] Exception getting backup token for {player_type}: {err:#}");
+                tracing::debug!(
+                    "[AdBlock] Exception getting backup token for {player_type}: {err:#}"
+                );
                 self.rate_limiter.mark_failed(player_type);
                 None
             }
@@ -199,17 +204,18 @@ impl BackupStreamManager {
     pub async fn get_ad_free_playlist(&mut self) -> Option<(String, String)> {
         if let Some(preferred) = self.preferred_type.clone()
             && !self.rate_limiter.is_failed(&preferred)
-            && self.preferred_at.is_some_and(|t| t.elapsed() < STICKY_TIMEOUT)
-            && let Some(content) = self.fetch_backup_playlist(&preferred).await {
-                if !has_ads(&content) {
-                    self.preferred_at = Some(Instant::now());
-                    tracing::debug!("[AdBlock] Using sticky preferred source: {preferred}");
-                    return Some((preferred, content));
-                }
-                tracing::debug!(
-                    "[AdBlock] Preferred source {preferred} now has ads, trying others..."
-                );
+            && self
+                .preferred_at
+                .is_some_and(|t| t.elapsed() < STICKY_TIMEOUT)
+            && let Some(content) = self.fetch_backup_playlist(&preferred).await
+        {
+            if !has_ads(&content) {
+                self.preferred_at = Some(Instant::now());
+                tracing::debug!("[AdBlock] Using sticky preferred source: {preferred}");
+                return Some((preferred, content));
             }
+            tracing::debug!("[AdBlock] Preferred source {preferred} now has ads, trying others...");
+        }
 
         for player_type in BACKUP_PLAYER_TYPES {
             if self.rate_limiter.is_failed(player_type) {
@@ -241,7 +247,10 @@ impl BackupStreamManager {
             .await
             .ok()?;
         if !resp.status().is_success() {
-            tracing::debug!("[AdBlock] Backup request failed with status {}", resp.status());
+            tracing::debug!(
+                "[AdBlock] Backup request failed with status {}",
+                resp.status()
+            );
             return None;
         }
         resp.text().await.ok()

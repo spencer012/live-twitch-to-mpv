@@ -33,9 +33,10 @@ pub fn select_variant<'a>(
                 }
             }
             _ => {
-                if let Some(v) = variants.iter().find(|v| {
-                    v.name.to_lowercase() == wanted || v.normalized_name() == wanted
-                }) {
+                if let Some(v) = variants
+                    .iter()
+                    .find(|v| v.name.to_lowercase() == wanted || v.normalized_name() == wanted)
+                {
                     return Some(v);
                 }
             }
@@ -120,8 +121,7 @@ mod tests {
     fn priority_order_falls_through() {
         let variants = typical();
         // user's config: 1080p60,1080p,720p60,720p,480p,360p — no 1440p here
-        let selected =
-            select_variant(&variants, &priority(&["1440p", "1080p", "720p60"])).unwrap();
+        let selected = select_variant(&variants, &priority(&["1440p", "1080p", "720p60"])).unwrap();
         assert_eq!(selected.name, "720p60");
     }
 
@@ -129,12 +129,16 @@ mod tests {
     fn best_and_worst() {
         let variants = typical();
         assert_eq!(
-            select_variant(&variants, &priority(&["best"])).unwrap().name,
+            select_variant(&variants, &priority(&["best"]))
+                .unwrap()
+                .name,
             "1080p60 (source)"
         );
         // worst ignores audio_only while video variants exist
         assert_eq!(
-            select_variant(&variants, &priority(&["worst"])).unwrap().name,
+            select_variant(&variants, &priority(&["worst"]))
+                .unwrap()
+                .name,
             "160p"
         );
     }
@@ -146,7 +150,9 @@ mod tests {
             v("720p60", Some((1280, 720)), Some(60.0), 3_400_000),
         ];
         assert_eq!(
-            select_variant(&variants, &priority(&["best"])).unwrap().name,
+            select_variant(&variants, &priority(&["best"]))
+                .unwrap()
+                .name,
             "720p60"
         );
     }
@@ -168,7 +174,9 @@ mod tests {
     fn audio_only_fallback_for_best() {
         let variants = vec![v("audio_only", None, None, 160_000)];
         assert_eq!(
-            select_variant(&variants, &priority(&["best"])).unwrap().name,
+            select_variant(&variants, &priority(&["best"]))
+                .unwrap()
+                .name,
             "audio_only"
         );
     }

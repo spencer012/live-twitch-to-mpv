@@ -209,9 +209,7 @@ async fn wait_for_stream(
                     bail!("no playable streams found on channel {channel}");
                 }
                 if config.retry.max > 0 && polls >= config.retry.max {
-                    bail!(
-                        "no playable streams found on channel {channel} after {polls} attempts"
-                    );
+                    bail!("no playable streams found on channel {channel} after {polls} attempts");
                 }
                 if polls == 1 {
                     tracing::info!(
@@ -399,7 +397,10 @@ async fn run_check(
             .unwrap_or_else(|| "audio".into());
         println!("  - {:<20} {:>9}  {} bps", v.name, res, v.bandwidth);
     }
-    println!("selected: {} ({})", resolved.variant.name, resolved.variant.uri);
+    println!(
+        "selected: {} ({})",
+        resolved.variant.name, resolved.variant.uri
+    );
 
     let resp = client
         .get(&resolved.variant.uri)
@@ -500,8 +501,16 @@ async fn main() -> Result<()> {
             tracing::warn!("Retrying stream open (attempt {attempt}/{attempts})...");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        match run_stream(&client, &api, &usher, &config, &channel, &resolved, title.as_deref())
-            .await
+        match run_stream(
+            &client,
+            &api,
+            &usher,
+            &config,
+            &channel,
+            &resolved,
+            title.as_deref(),
+        )
+        .await
         {
             Ok(_) => return Ok(()),
             Err(err) => {

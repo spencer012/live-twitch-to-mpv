@@ -320,14 +320,7 @@ impl TwitchM3U8Parser {
         // Twitch sometimes incorrectly inserts discontinuity tags between
         // segments of the live content: clear them when neither the current
         // nor the previous segment is an ad.
-        if discontinuity
-            && !ad
-            && self
-                .playlist
-                .segments
-                .last()
-                .is_some_and(|last| !last.ad)
-        {
+        if discontinuity && !ad && self.playlist.segments.last().is_some_and(|last| !last.ad) {
             discontinuity = false;
         }
 
@@ -486,7 +479,10 @@ mod tests {
         assert_eq!(playlist.segments.len(), 2);
         assert_eq!(playlist.segments[0].num, 100);
         assert_eq!(playlist.segments[1].num, 101);
-        assert_eq!(playlist.segments[0].uri, "https://example.com/hls/seg100.ts");
+        assert_eq!(
+            playlist.segments[0].uri,
+            "https://example.com/hls/seg100.ts"
+        );
         assert_eq!(playlist.segments[0].title.as_deref(), Some("live"));
         assert!(!playlist.segments[0].ad);
         assert!(!playlist.is_endlist);
@@ -601,7 +597,10 @@ mod tests {
         let p1 = &playlist.segments[1];
         let p2 = &playlist.segments[2];
         assert!(p1.ad, "prefetch after discontinuity must be flagged as ad");
-        assert!(p2.ad, "discontinuity state persists across prefetch segments");
+        assert!(
+            p2.ad,
+            "discontinuity state persists across prefetch segments"
+        );
         // ad transition sets the prefetch segment's discontinuity flag
         assert!(p1.discontinuity);
         assert!(!p2.discontinuity);
@@ -618,7 +617,10 @@ mod tests {
              #EXT-X-TWITCH-PREFETCH:prefetch31.ts\n",
         );
         let p = &playlist.segments[1];
-        assert!(p.ad, "prefetch whose extrapolated date is in an ad daterange");
+        assert!(
+            p.ad,
+            "prefetch whose extrapolated date is in an ad daterange"
+        );
     }
 
     #[test]
@@ -682,9 +684,7 @@ mod tests {
 
     #[test]
     fn endlist_detected() {
-        let playlist = seg_playlist(
-            "#EXTINF:2.000,live\nseg.ts\n#EXT-X-ENDLIST\n",
-        );
+        let playlist = seg_playlist("#EXTINF:2.000,live\nseg.ts\n#EXT-X-ENDLIST\n");
         assert!(playlist.is_endlist);
     }
 
