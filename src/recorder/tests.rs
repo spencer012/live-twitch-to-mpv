@@ -530,3 +530,82 @@ async fn player_pipeline_carries_bytes_only() {
     assert_eq!(data, expected);
     assert_eq!(pipeline.worker.await.unwrap(), WorkerExit::Endlist);
 }
+
+const FMP4_FIXTURE: &str = "#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:10
+#EXT-X-MAP:URI=\"/init-a.mp4\"
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00.000Z
+#EXTINF:2.000,live
+/f10.mp4
+#EXT-X-MAP:URI=\"/init-a-resigned.mp4\"
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:02.000Z
+#EXTINF:2.000,live
+/f11.mp4
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI=\"/init-b.mp4\"
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:04.000Z
+#EXTINF:2.000,live
+/f12.mp4
+#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:06.000Z
+#EXTINF:2.000,live
+/f13.mp4
+#EXT-X-ENDLIST
+";
+
+#[tokio::test]
+async fn fmp4_init_sections_are_written_once_per_change() {
+    let mut routes = HashMap::new();
+    routes.insert("/playlist.m3u8".into(), route(FMP4_FIXTURE.as_bytes().to_vec()));
+    routes.insert("/init-a.mp4".into(), route(body(40, 0xA0)));
+    // same init behind a new (re-signed) URL: not written again
+    routes.insert("/init-a-resigned.mp4".into(), route(body(40, 0xA0)));
+    routes.insert("/init-b.mp4".into(), route(body(50, 0xB0)));
+    for (n, b) in [(10, 10u8), (11, 11), (12, 12), (13, 13)] {
+        routes.insert(format!("/f{n}.mp4"), route(body(100, b)));
+    }
+    let base = serve(routes).await;
+    let hook: Arc<Mutex<dyn SegmentHook>> = Arc::new(Mutex::new(AdFilterHook::default()));
+    let (end, lines, data, _session) = record_fixture(hook, &base, "fmp4").await;
+
+    assert_eq!(end, AttemptEnd::Stream(WorkerExit::Endlist));
+    let mut expected = body(40, 0xA0);
+    expected.extend(body(100, 10));
+    expected.extend(body(100, 11));
+    expected.extend(body(50, 0xB0));
+    expected.extend(body(100, 12));
+    expected.extend(body(100, 13));
+    assert_eq!(data, expected);
+    // the init bytes belong to the slot they precede
+    assert_offsets_cover(&lines, &data);
+    let lengths: Vec<u64> = of_type(&lines, "segment")
+        .iter()
+        .map(|s| s["length"].as_u64().unwrap())
+        .collect();
+    assert_eq!(lengths, vec![140, 100, 150, 100]);
+}
+
+#[tokio::test]
+async fn fmp4_missing_init_still_writes_segments_and_retries() {
+    let playlist = FMP4_FIXTURE
+        .replace("/init-a.mp4", "/gone.mp4")
+        .replace("/init-a-resigned.mp4", "/gone.mp4");
+    let mut routes = HashMap::new();
+    routes.insert("/playlist.m3u8".into(), route(playlist.into_bytes()));
+    routes.insert("/init-b.mp4".into(), route(body(50, 0xB0)));
+    for (n, b) in [(10, 10u8), (11, 11), (12, 12), (13, 13)] {
+        routes.insert(format!("/f{n}.mp4"), route(body(100, b)));
+    }
+    let base = serve(routes).await;
+    let hook: Arc<Mutex<dyn SegmentHook>> = Arc::new(Mutex::new(AdFilterHook::default()));
+    let (_end, lines, data, _session) = record_fixture(hook, &base, "fmp4-missing").await;
+
+    let mut expected = body(100, 10);
+    expected.extend(body(100, 11));
+    expected.extend(body(50, 0xB0));
+    expected.extend(body(100, 12));
+    expected.extend(body(100, 13));
+    assert_eq!(data, expected);
+    assert_offsets_cover(&lines, &data);
+}

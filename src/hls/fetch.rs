@@ -6,11 +6,19 @@
 //!
 //! With `FetcherConfig::events` set (recorder mode), every slot is also
 //! reported in write-out order via in-band [`SlotMarker`]s.
+//!
+//! fMP4 (CMAF) streams carry their `moov` in an `EXT-X-MAP` init section
+//! instead of in every segment. The write-out stage fetches it when a
+//! segment's map URI changes and writes it in front of that segment (inside
+//! the same slot) whenever its bytes differ from the last init written, so
+//! the output starts with a playable header and a mid-stream init change is
+//! carried along, while a re-signed URL for the same init is not repeated.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
@@ -140,6 +148,7 @@ impl SegmentFetcher {
         };
         let mut fetch_rx = fetch_rx;
         let mut wrote_discontinuity_warning = false;
+        let mut init = InitState::default();
         while let Some(handle) = fetch_rx.recv().await {
             let Ok(outcome) = handle.await else {
                 continue;
@@ -154,6 +163,18 @@ impl SegmentFetcher {
                         &segment,
                         substitute.as_ref(),
                     )));
+                    // a substitute comes from another playlist: its init (if
+                    // any) is unknown, so the live map is left alone
+                    let header = match (&segment.map_uri, &substitute) {
+                        (Some(uri), None) => this.init_for(&mut init, uri).await,
+                        _ => None,
+                    };
+                    if let Some(header) = header
+                        && out.send(header).await.is_err()
+                    {
+                        tracing::debug!("Output closed, stopping fetcher");
+                        break;
+                    }
                     match this
                         .stream_response(&out, &segment, response, substitute.is_some())
                         .await
@@ -209,6 +230,40 @@ impl SegmentFetcher {
         tracing::debug!("Fetcher finished");
     }
 
+    /// The init section to write before a segment mapped to `uri`, if it is
+    /// new. A failed fetch writes nothing (the segment still goes out, as
+    /// before this existed) and is retried on the next segment.
+    async fn init_for(&self, state: &mut InitState, uri: &str) -> Option<Bytes> {
+        if state.uri.as_deref() == Some(uri) {
+            return None;
+        }
+        let fetched = match self.fetch_url(uri).await {
+            Ok(response) => response.bytes().await.context("init section download failed"),
+            Err(err) => Err(err),
+        };
+        let data = match fetched {
+            Ok(data) if !data.is_empty() => data,
+            Ok(_) => {
+                tracing::error!("Init section (EXT-X-MAP) is empty");
+                return None;
+            }
+            Err(err) => {
+                tracing::error!(
+                    "Failed to fetch init section (EXT-X-MAP): {}",
+                    events::redact_urls(&format!("{err:#}"))
+                );
+                return None;
+            }
+        };
+        state.uri = Some(uri.to_string());
+        if state.written.as_ref() == Some(&data) {
+            return None;
+        }
+        tracing::info!("Writing fMP4 init section ({} bytes)", data.len());
+        state.written = Some(data.clone());
+        Some(data)
+    }
+
     async fn stream_response(
         &self,
         out: &ByteSender,
@@ -255,6 +310,13 @@ impl SegmentFetcher {
             Err(err) => FetchOutcome::Failed(segment, err, substitute),
         }
     }
+}
+
+/// The last init section fetched (by URI) and written (by content).
+#[derive(Default)]
+struct InitState {
+    uri: Option<String>,
+    written: Option<Bytes>,
 }
 
 enum StreamWrite {
