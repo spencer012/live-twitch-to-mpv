@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -214,8 +215,9 @@ async fn record_fixture(
     let path = temp_path(name);
     let events = SharedBuf::default();
     let mut session = Session::new(EventLog::to_writer(Box::new(events.clone())), 0);
-    let (mut out, offset) = Output::open(&path, false).unwrap();
+    let (out, offset) = Output::open(&path, false).unwrap();
     assert_eq!(offset, 0);
+    let mut out = Sink::plain(out, &path);
     let (_tx, mut shutdown) = Shutdown::manual();
 
     let client = reqwest::Client::new();
@@ -402,7 +404,8 @@ async fn signal_stops_promptly_and_reports_partial_segment() {
     let path = temp_path("signal");
     let events = SharedBuf::default();
     let mut session = Session::new(EventLog::to_writer(Box::new(events.clone())), 0);
-    let (mut out, _) = Output::open(&path, false).unwrap();
+    let (out, _) = Output::open(&path, false).unwrap();
+    let mut out = Sink::plain(out, &path);
     let (signal_tx, mut shutdown) = Shutdown::manual();
     let client = reqwest::Client::new();
     let mut config = test_config();
@@ -557,7 +560,10 @@ const FMP4_FIXTURE: &str = "#EXTM3U
 #[tokio::test]
 async fn fmp4_init_sections_are_written_once_per_change() {
     let mut routes = HashMap::new();
-    routes.insert("/playlist.m3u8".into(), route(FMP4_FIXTURE.as_bytes().to_vec()));
+    routes.insert(
+        "/playlist.m3u8".into(),
+        route(FMP4_FIXTURE.as_bytes().to_vec()),
+    );
     routes.insert("/init-a.mp4".into(), route(body(40, 0xA0)));
     // same init behind a new (re-signed) URL: not written again
     routes.insert("/init-a-resigned.mp4".into(), route(body(40, 0xA0)));
@@ -608,4 +614,627 @@ async fn fmp4_missing_init_still_writes_segments_and_retries() {
     expected.extend(body(100, 13));
     assert_eq!(data, expected);
     assert_offsets_cover(&lines, &data);
+}
+
+// ---------------------------------------------------------------------------
+// Ring mode and output switches
+// ---------------------------------------------------------------------------
+
+use crate::recorder::control::{ControlMsg, ControlTx, SwitchRequest};
+
+/// A playlist of `n` 2-second segments `/s<seq>.m` from `first`, ENDLIST.
+/// `maps`: `(seq, uri)` puts an EXT-X-MAP before that segment (after a
+/// discontinuity unless it is the first).
+fn long_playlist(first: i64, n: i64, maps: &[(i64, &str)]) -> String {
+    let mut p = format!(
+        "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:{first}\n"
+    );
+    for seq in first..first + n {
+        if let Some((_, uri)) = maps.iter().find(|(s, _)| *s == seq) {
+            if seq != first {
+                p.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+            p.push_str(&format!("#EXT-X-MAP:URI=\"{uri}\"\n"));
+        }
+        let secs = (seq - first) * 2;
+        p.push_str(&format!(
+            "#EXT-X-PROGRAM-DATE-TIME:2026-01-01T{:02}:{:02}:{:02}.000Z\n#EXTINF:2.000,live\n/s{seq}.m\n",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        ));
+    }
+    p.push_str("#EXT-X-ENDLIST\n");
+    p
+}
+
+fn seg_body(seq: i64) -> Vec<u8> {
+    body(100 + (seq % 7) as usize, seq as u8)
+}
+
+async fn long_server(first: i64, n: i64, maps: &[(i64, &str, Vec<u8>)]) -> String {
+    let map_refs: Vec<(i64, &str)> = maps.iter().map(|(s, u, _)| (*s, *u)).collect();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/playlist.m3u8".to_string(),
+        route(long_playlist(first, n, &map_refs).into_bytes()),
+    );
+    for (_, uri, data) in maps {
+        routes.insert(uri.to_string(), route(data.clone()));
+    }
+    for seq in first..first + n {
+        routes.insert(
+            format!("/s{seq}.m"),
+            Route {
+                delay: Duration::from_millis(15),
+                ..route(seg_body(seq))
+            },
+        );
+    }
+    serve(routes).await
+}
+
+/// Fetches everything; when the hook is asked about a trigger sequence (it
+/// is consulted in playlist order, ahead of the write-out), it sends the
+/// control messages attached to it.
+struct TriggerHook {
+    tx: ControlTx,
+    triggers: Vec<(i64, SwitchRequest)>,
+}
+
+#[async_trait]
+impl SegmentHook for TriggerHook {
+    async fn on_playlist(&mut self, _playlist: &MediaPlaylist) {}
+
+    async fn segment_action(&mut self, segment: &MediaSegment) -> SegmentAction {
+        for (seq, req) in &self.triggers {
+            if *seq == segment.num {
+                let _ = self.tx.send(ControlMsg::Request(req.clone()));
+            }
+        }
+        SegmentAction::Fetch
+    }
+}
+
+fn request(id: &str, dir: &std::path::Path, n: u32) -> SwitchRequest {
+    SwitchRequest {
+        id: id.into(),
+        action: None,
+        output: dir.join(format!("out{n}.m")),
+        events: dir.join(format!("events{n}.jsonl")),
+    }
+}
+
+fn test_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("twitchpipe-sw-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn read_lines(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn slots(lines: &[Value]) -> Vec<i64> {
+    of_type(lines, "segment")
+        .iter()
+        .map(|s| s["slot_sequence"].as_i64().unwrap())
+        .collect()
+}
+
+/// Record the long fixture into `out` with switch requests sent at the
+/// trigger sequences; returns the exit code of the run.
+async fn record_switching(
+    base: &str,
+    mut session: Session,
+    out: &mut Sink,
+    triggers: Vec<(i64, SwitchRequest)>,
+    open_timeout: Duration,
+) -> (AttemptEnd, Session) {
+    let tx = session.enable_control(open_timeout);
+    let hook: Arc<Mutex<dyn SegmentHook>> = Arc::new(Mutex::new(TriggerHook { tx, triggers }));
+    let (_signal, mut shutdown) = Shutdown::manual();
+    let client = reqwest::Client::new();
+    let mut config = test_config();
+    config.stream.segment_threads = 1;
+    let (etx, erx) = mpsc::unbounded_channel();
+    let pipeline = crate::spawn_pipeline(
+        &client,
+        &format!("{base}/playlist.m3u8"),
+        &config,
+        hook,
+        Some(etx),
+    );
+    session.tracker.begin_attempt(false);
+    let end = tokio::time::timeout(
+        Duration::from_secs(30),
+        session.run_attempt(pipeline, erx, out, Duration::from_secs(10), &mut shutdown),
+    )
+    .await
+    .expect("recording finished");
+    session.close(out).await;
+    let segments = session.tracker.lifetime_segments();
+    session.finish(finish_for(&end, segments, Duration::from_secs(10)));
+    (end, session)
+}
+
+fn file_session(events: &std::path::Path) -> Session {
+    let mut session = Session::new(EventLog::open(events, false).unwrap(), 0);
+    session.set_events_path(Some(events.to_path_buf()));
+    session
+}
+
+fn start_line(output: &std::path::Path) -> Event {
+    let mut start = start_template();
+    start.output = output.display().to_string();
+    Event::Start(Box::new(start))
+}
+
+fn start_template() -> Start {
+    Start {
+        schema: events::SCHEMA_VERSION,
+        version: "test",
+        pid: 1,
+        channel: "test".into(),
+        quality: "source".into(),
+        resolution: None,
+        width: None,
+        height: None,
+        framerate: None,
+        codecs: None,
+        bandwidth: 0,
+        low_latency: false,
+        live_edge: 3,
+        ad_block: true,
+        persist_stream: false,
+        recovery_timeout: 0.0,
+        segment_threads: 1,
+        segment_attempts: 1,
+        segment_timeout: 5.0,
+        stream_timeout: 10.0,
+        supported_codecs: Vec::new(),
+        output: String::new(),
+        output_offset: 0,
+        stream_id: None,
+        title: None,
+        category: None,
+        ring: None,
+        control: None,
+        request_id: None,
+    }
+}
+
+#[tokio::test]
+async fn output_switches_are_contiguous_and_idempotent() {
+    const FIRST: i64 = 100;
+    const N: i64 = 80;
+    let base = long_server(FIRST, N, &[]).await;
+    let dir = test_dir("plain");
+    let (out0, ev0) = (dir.join("out0.m"), dir.join("events0.jsonl"));
+    let mut session = file_session(&ev0);
+    session.emit(start_line(&out0));
+    let (o, _) = Output::open(&out0, false).unwrap();
+    let mut out = Sink::plain(o, &out0);
+    let (a, b) = (request("a", &dir, 1), request("b", &dir, 2));
+    let triggers = vec![(130, a.clone()), (150, b.clone()), (165, a.clone())];
+    let (end, _) =
+        record_switching(&base, session, &mut out, triggers, Duration::from_secs(10)).await;
+    assert_eq!(end, AttemptEnd::Stream(WorkerExit::Endlist));
+    drop(out);
+
+    let files = [(out0, ev0), (a.output, a.events), (b.output, b.events)];
+    let mut all_slots = Vec::new();
+    let mut all_data = Vec::new();
+    for (i, (output, events)) in files.iter().enumerate() {
+        let lines = read_lines(events);
+        let data = std::fs::read(output).unwrap();
+        assert!(!data.is_empty(), "output {i} is empty");
+        // every events file starts like a fresh recording
+        assert_eq!(lines[0]["type"], "start", "{i}");
+        assert_eq!(lines[0]["output"], output.display().to_string());
+        assert_eq!(lines[0]["output_offset"], 0);
+        assert_offsets_cover(&lines, &data);
+        all_slots.extend(slots(&lines));
+        all_data.extend(data);
+    }
+    // no gap and no duplicate across the switches
+    assert_eq!(all_slots, (FIRST..FIRST + N).collect::<Vec<_>>());
+    let expected: Vec<u8> = (FIRST..FIRST + N).flat_map(seg_body).collect();
+    assert_eq!(all_data, expected);
+
+    let l0 = read_lines(&files[0].1);
+    let l1 = read_lines(&files[1].1);
+    let l2 = read_lines(&files[2].1);
+    // the old file ends with the acknowledgement; the new one has it after its start
+    let sw_a = l0.last().unwrap();
+    assert_eq!(sw_a["type"], "output_switched");
+    assert_eq!(sw_a["request_id"], "a");
+    assert_eq!(sw_a["repeat"], false);
+    assert_eq!(l1[0]["request_id"], "a");
+    assert_eq!(
+        &l1[1],
+        &Value::Object({
+            let mut m = sw_a.as_object().unwrap().clone();
+            m.insert("ts".into(), l1[1]["ts"].clone());
+            m
+        })
+    );
+    let last0 = *slots(&l0).last().unwrap();
+    assert_eq!(sw_a["last_slot_sequence"], last0);
+    assert_eq!(sw_a["last_sequence"], last0);
+    assert_eq!(sw_a["next_slot_sequence"], slots(&l1)[0]);
+    assert_eq!(
+        sw_a["from"]["end_offset"].as_u64().unwrap(),
+        std::fs::metadata(&files[0].0).unwrap().len()
+    );
+    assert_eq!(sw_a["to"]["offset"], 0);
+    assert_eq!(sw_a["init"], false);
+    // end date of the last segment = its PDT + 2 s
+    let last_pdt = of_type(&l0, "segment").last().unwrap()["program_date_time"].clone();
+    let secs = |v: &Value| {
+        chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap())
+            .unwrap()
+            .timestamp()
+    };
+    assert_eq!(secs(&sw_a["program_date_time"]), secs(&last_pdt) + 2);
+
+    let sw_b = l1.last().unwrap();
+    assert_eq!(
+        (sw_b["type"].as_str(), sw_b["request_id"].as_str()),
+        (Some("output_switched"), Some("b"))
+    );
+    assert_eq!(l2[0]["request_id"], "b");
+    assert_eq!(l2[1]["request_id"], "b");
+    // repeating "a" re-acknowledged it in the current file, and switched nothing
+    let repeats: Vec<&Value> = l2
+        .iter()
+        .filter(|l| l["type"] == "output_switched" && l["repeat"] == true)
+        .collect();
+    assert_eq!(repeats.len(), 1);
+    assert_eq!(repeats[0]["request_id"], "a");
+    assert_eq!(repeats[0]["to"], sw_a["to"]);
+    assert_eq!(l2.last().unwrap()["type"], "end");
+    // the end totals describe this output only
+    assert_eq!(
+        l2.last().unwrap()["bytes"].as_u64().unwrap(),
+        std::fs::metadata(&files[2].0).unwrap().len()
+    );
+    assert_eq!(l2.last().unwrap()["reason"], "stream_ended");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn ring_rotates_prunes_and_switches_out() {
+    const FIRST: i64 = 100;
+    const N: i64 = 80;
+    let base = long_server(FIRST, N, &[]).await;
+    let dir = test_dir("ring");
+    let ring_dir = dir.join("ring");
+    let ev0 = dir.join("events0.jsonl");
+    let mut session = file_session(&ev0);
+    session.emit(start_line(&ring_dir));
+    // 3 segments per chunk, keep at least 10 s
+    let mut out = Sink::Ring(Box::new(Ring::create(&ring_dir, 10.0, 6.0).unwrap()));
+    let a = request("a", &dir, 1);
+    let (end, _) = record_switching(
+        &base,
+        session,
+        &mut out,
+        vec![(160, a.clone())],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(end, AttemptEnd::Stream(WorkerExit::Endlist));
+    drop(out);
+
+    let l0 = read_lines(&ev0);
+    let l1 = read_lines(&a.events);
+    let chunks = of_type(&l0, "chunk");
+    assert!(chunks.len() >= 5, "{}", chunks.len());
+    // chunks tile the ring's output, are cut at segment ends and hold whole segments
+    let mut offset = 0;
+    let mut next_slot = FIRST;
+    for (i, c) in chunks.iter().enumerate() {
+        assert_eq!(c["index"], i as u64 + 1);
+        assert_eq!(c["offset"].as_u64().unwrap(), offset);
+        assert_eq!(c["first_slot_sequence"], next_slot);
+        assert_eq!(c["init_length"], 0);
+        offset += c["length"].as_u64().unwrap();
+        next_slot = c["last_slot_sequence"].as_i64().unwrap() + 1;
+        // the last one is cut by the switch (unless the switch came right
+        // after a rotation)
+        if c["closed_by"] == "rotate" {
+            assert_eq!(c["segments"], 3);
+            assert_eq!(c["duration"], 6.0);
+        } else {
+            assert_eq!(c["closed_by"], "switch");
+            assert_eq!(i + 1, chunks.len());
+        }
+        assert!(
+            c["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("chunk-{:06}.ts", i + 1))
+        );
+    }
+    let prunes = of_type(&l0, "ring")
+        .into_iter()
+        .filter(|r| r["action"] == "prune")
+        .collect::<Vec<_>>();
+    assert!(!prunes.is_empty());
+    for p in &prunes {
+        assert!(p["held_seconds"].as_f64().unwrap() >= 10.0, "{p}");
+    }
+
+    let sw = l0.last().unwrap();
+    assert_eq!(sw["type"], "output_switched");
+    assert_eq!(sw["from"]["output"], ring_dir.display().to_string());
+    assert_eq!(sw["from"]["end_offset"].as_u64().unwrap(), offset);
+    let held = sw["from"]["chunks"].as_array().unwrap();
+    let held_s: f64 = held.iter().map(|c| c["duration"].as_f64().unwrap()).sum();
+    assert!(held_s >= 10.0, "{held_s}");
+    // pruned chunks are gone; the held ones stay, untouched, after the switch
+    let held_paths: Vec<&str> = held.iter().map(|c| c["path"].as_str().unwrap()).collect();
+    for c in &chunks {
+        let path = c["path"].as_str().unwrap();
+        assert_eq!(
+            std::path::Path::new(path).exists(),
+            held_paths.contains(&path),
+            "{path}"
+        );
+    }
+    let mut data = Vec::new();
+    for c in held {
+        let bytes = std::fs::read(c["path"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes.len() as u64, c["length"].as_u64().unwrap());
+        data.extend(bytes);
+    }
+    let first_held = held[0]["first_slot_sequence"].as_i64().unwrap();
+    let base_offset = held[0]["offset"].as_u64().unwrap();
+    // ring segments from the base on, then the switched output's: contiguous
+    let mut seen: Vec<i64> = of_type(&l0, "segment")
+        .iter()
+        .filter(|s| s["offset"].as_u64().unwrap() >= base_offset)
+        .map(|s| s["slot_sequence"].as_i64().unwrap())
+        .collect();
+    seen.extend(slots(&l1));
+    assert_eq!(seen, (first_held..FIRST + N).collect::<Vec<_>>());
+    data.extend(std::fs::read(&a.output).unwrap());
+    let expected: Vec<u8> = (first_held..FIRST + N).flat_map(seg_body).collect();
+    assert_eq!(data, expected);
+    assert_offsets_cover(&l1, &std::fs::read(&a.output).unwrap());
+    assert_eq!(l1[0]["type"], "start");
+    assert!(l1[0].get("ring").is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn fmp4_ring_chunks_and_switched_outputs_start_with_the_init() {
+    const FIRST: i64 = 10;
+    const N: i64 = 60;
+    let init_a = body(40, 0xA0);
+    let init_b = body(50, 0xB0);
+    // the init changes at segment 30 (with a discontinuity)
+    let maps = [
+        (FIRST, "/init-a.mp4", init_a.clone()),
+        (30, "/init-b.mp4", init_b.clone()),
+    ];
+    let base = long_server(FIRST, N, &maps).await;
+    let dir = test_dir("fmp4");
+    let ring_dir = dir.join("ring");
+    let ev0 = dir.join("events0.jsonl");
+    let mut session = file_session(&ev0);
+    session.emit(start_line(&ring_dir));
+    // one segment per chunk, keep 30 s: chunks before and after the change stay
+    let mut out = Sink::Ring(Box::new(Ring::create(&ring_dir, 30.0, 2.0).unwrap()));
+    let a = request("a", &dir, 1);
+    let b = request("b", &dir, 2);
+    let triggers = vec![(58, a.clone()), (64, b.clone())];
+    record_switching(&base, session, &mut out, triggers, Duration::from_secs(10)).await;
+    drop(out);
+
+    let init_for = |seq: i64| if seq < 30 { &init_a } else { &init_b };
+    let l0 = read_lines(&ev0);
+    let sw = of_type(&l0, "output_switched")[0].clone();
+    assert_eq!(sw["init"], true);
+    let held = sw["from"]["chunks"].as_array().unwrap();
+    assert!(held.len() >= 15, "{}", held.len());
+    let first = held[0]["first_slot_sequence"].as_i64().unwrap();
+    assert!(first < 30, "the held chunks span the init change: {first}");
+    for c in held {
+        let seq = c["first_slot_sequence"].as_i64().unwrap();
+        assert_eq!(c["last_slot_sequence"], seq);
+        assert!(c["path"].as_str().unwrap().ends_with(".mp4"));
+        // each chunk plays on its own: exactly one init (never two) then the segment
+        let mut expected = init_for(seq).clone();
+        expected.extend(seg_body(seq));
+        assert_eq!(
+            std::fs::read(c["path"].as_str().unwrap()).unwrap(),
+            expected,
+            "chunk of {seq}"
+        );
+        assert_eq!(
+            c["init_length"].as_u64().unwrap(),
+            init_for(seq).len() as u64
+        );
+    }
+    // every switched output starts with the init, inside its first segment
+    let mut next = held.last().unwrap()["last_slot_sequence"].as_i64().unwrap() + 1;
+    for r in [&a, &b] {
+        let lines = read_lines(&r.events);
+        let data = std::fs::read(&r.output).unwrap();
+        assert_offsets_cover(&lines, &data);
+        let s = slots(&lines);
+        assert_eq!(s[0], next, "{}", r.id);
+        let mut expected = init_b.clone();
+        for seq in &s {
+            expected.extend(seg_body(*seq));
+        }
+        assert_eq!(data, expected, "{}", r.id);
+        next = s.last().unwrap() + 1;
+    }
+    assert_eq!(next, FIRST + N);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_hung_open_never_stalls_the_recording() {
+    const FIRST: i64 = 100;
+    const N: i64 = 80;
+    let base = long_server(FIRST, N, &[]).await;
+    let dir = test_dir("hung");
+    let (out0, ev0) = (dir.join("out0.m"), dir.join("events0.jsonl"));
+    // opening a FIFO for writing blocks until a reader shows up: a hung mount
+    let fifo = dir.join("hung.m");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let hung = SwitchRequest {
+        output: fifo.clone(),
+        ..request("hung", &dir, 9)
+    };
+    let missing = SwitchRequest {
+        output: dir.join("no/such/dir/out.m"),
+        ..request("missing", &dir, 8)
+    };
+    let same = SwitchRequest {
+        output: out0.clone(),
+        ..request("same", &dir, 7)
+    };
+    let good = request("good", &dir, 1);
+    let mut session = file_session(&ev0);
+    session.emit(start_line(&out0));
+    let (o, _) = Output::open(&out0, false).unwrap();
+    let mut out = Sink::plain(o, &out0);
+    // all at once: they are worked through one after the other
+    let triggers = vec![
+        (125, hung.clone()),
+        (125, missing.clone()),
+        (125, same.clone()),
+        (125, good.clone()),
+        (160, missing.clone()),
+    ];
+    let started = std::time::Instant::now();
+    let (end, _) = record_switching(
+        &base,
+        session,
+        &mut out,
+        triggers,
+        Duration::from_millis(400),
+    )
+    .await;
+    assert_eq!(end, AttemptEnd::Stream(WorkerExit::Endlist));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    drop(out);
+    // let the stuck open finish (it closes the file again: the request was abandoned)
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o4000) // O_NONBLOCK
+        .open(&fifo);
+
+    let l0 = read_lines(&ev0);
+    let failed: Vec<(&str, &str, bool)> = of_type(&l0, "output_switch_failed")
+        .iter()
+        .map(|f| {
+            (
+                f["request_id"].as_str().unwrap(),
+                f["reason"].as_str().unwrap(),
+                f["repeat"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        failed,
+        vec![
+            ("hung", "open_timeout", false),
+            ("missing", "open_failed", false),
+            ("same", "invalid", false),
+        ]
+    );
+    let requested: Vec<&str> = of_type(&l0, "output_switch_requested")
+        .iter()
+        .map(|r| r["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(requested, vec!["hung", "missing", "good"]);
+    // segments kept going into the old output while the open hung
+    let timeout_at = l0
+        .iter()
+        .position(|l| l["type"] == "output_switch_failed")
+        .unwrap();
+    let requested_at = l0
+        .iter()
+        .position(|l| l["type"] == "output_switch_requested")
+        .unwrap();
+    let during = l0[requested_at..timeout_at]
+        .iter()
+        .filter(|l| l["type"] == "segment")
+        .count();
+    assert!(during >= 5, "{during} segments written while the open hung");
+
+    let l1 = read_lines(&good.events);
+    let mut all = slots(&l0);
+    all.extend(slots(&l1));
+    assert_eq!(all, (FIRST..FIRST + N).collect::<Vec<_>>());
+    // the repeated failed request is re-acknowledged, not retried
+    let repeated: Vec<&Value> = of_type(&l1, "output_switch_failed");
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(
+        (
+            repeated[0]["request_id"].as_str(),
+            repeated[0]["repeat"].as_bool()
+        ),
+        (Some("missing"), Some(true))
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_switch_left_pending_at_the_end_is_reported() {
+    let base = long_server(100, 5, &[]).await;
+    let dir = test_dir("pending");
+    let (out0, ev0) = (dir.join("out0.m"), dir.join("events0.jsonl"));
+    let fifo = dir.join("hung.m");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let hung = SwitchRequest {
+        output: fifo.clone(),
+        ..request("hung", &dir, 9)
+    };
+    let mut session = file_session(&ev0);
+    session.emit(start_line(&out0));
+    let (o, _) = Output::open(&out0, false).unwrap();
+    let mut out = Sink::plain(o, &out0);
+    record_switching(
+        &base,
+        session,
+        &mut out,
+        vec![(100, hung)],
+        Duration::from_secs(60),
+    )
+    .await;
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o4000)
+        .open(&fifo);
+    let l0 = read_lines(&ev0);
+    let failed = of_type(&l0, "output_switch_failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["reason"], "recording_ended");
+    assert_eq!(l0.last().unwrap()["type"], "end");
+    assert_eq!(slots(&l0), (100..105).collect::<Vec<_>>());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

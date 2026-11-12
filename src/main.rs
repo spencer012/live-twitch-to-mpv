@@ -707,6 +707,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_ring_and_control_flags() {
+        let cli = parse(&[
+            "--record",
+            "--ring-dir",
+            "/spool/ring",
+            "--ring-keep-s",
+            "300",
+            "--ring-chunk-s",
+            "30",
+            "--events",
+            "/spool/ring/events.jsonl",
+            "--control",
+            "/run/ctl.json",
+            "--control-open-timeout",
+            "60",
+            "chan",
+        ])
+        .unwrap();
+        let r = &cli.record;
+        assert_eq!(r.ring_dir, Some(PathBuf::from("/spool/ring")));
+        assert_eq!((r.ring_keep_s, r.ring_chunk_s), (Some(300.0), Some(30.0)));
+        assert_eq!(r.control, Some(PathBuf::from("/run/ctl.json")));
+        assert_eq!(r.control_open_timeout, Some(60.0));
+        assert!(r.output.is_none());
+
+        // a ring replaces --output; its options need it; all need --record
+        assert!(parse(&["--record", "--ring-dir", "d", "--output", "o", "chan"]).is_err());
+        assert!(parse(&["--record", "--ring-dir", "d", "--append", "chan"]).is_err());
+        // (clap lets --ring-keep-s pass next to --output, since --ring-dir
+        // conflicts with --output: recorder::run refuses it as a usage error)
+        assert!(parse(&["--ring-dir", "d", "chan"]).is_err());
+        assert!(parse(&["--control", "c", "chan"]).is_err());
+        assert!(
+            parse(&[
+                "--record",
+                "--output",
+                "o",
+                "--control-open-timeout",
+                "5",
+                "chan"
+            ])
+            .is_err()
+        );
+        // a plain recording can be switched too
+        let cli = parse(&["--record", "--output", "o", "--control", "c", "chan"]).unwrap();
+        assert_eq!(cli.record.control, Some(PathBuf::from("c")));
+    }
+
+    #[test]
     fn last_toggle_wins() {
         let cli = parse(&["--ad-block", "--no-ad-block", "chan"]).unwrap();
         assert!(!cli.overrides.ad_block && cli.overrides.no_ad_block);

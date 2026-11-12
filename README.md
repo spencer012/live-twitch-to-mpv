@@ -100,6 +100,11 @@ twitchpipe --record --check some_channel
 | `--output <PATH\|->` | MPEG-TS destination (required unless `--check`). A new or empty file is used; an existing non-empty file is refused unless `--append`. `-` = stdout. |
 | `--events <PATH\|->` | JSON Lines events (see below). Same file rules as `--output`. `-` = stdout (not together with `--output -`). |
 | `--append` | Append to existing non-empty output/events files. Byte offsets in events are absolute file offsets (`start.output_offset` is the old length). |
+| `--ring-dir <DIR>` | Ring mode instead of `--output`: rotating chunk files in DIR (see [Ring mode](#ring-mode)). Needs `--events`; not with `--append`. |
+| `--ring-keep-s <SECS>` | Ring mode: keep at least this many seconds of media (default 300). |
+| `--ring-chunk-s <SECS>` | Ring mode: close a chunk at the first segment end once it holds this many seconds (default 60). |
+| `--control <PATH>` | Watch this file for output switch requests (see [Output switch](#output-switch---control)). Works with `--output` and `--ring-dir`. |
+| `--control-open-timeout <SECS>` | Give up on a switch whose new files are not open after this long (default 120). |
 
 Config overrides, usable in every mode (config file values otherwise apply):
 `--oauth-token-file <PATH>` (file contains the token, with or without an
@@ -125,6 +130,96 @@ Recorder-specific behaviour:
   (at most ~2 s), the output and events file are flushed, the `end` event is
   written and the process exits (a watchdog forces exit after 6 s). A
   segment cut off by the signal is reported with `complete: false`.
+
+### Ring mode
+
+`--ring-dir DIR` keeps the last minutes of a stream on disk without growing
+forever: a loop recorder's pre-roll.
+
+```sh
+twitchpipe --record --ring-dir /spool/ring/chan/1731400000 --ring-keep-s 300 \
+    --events /spool/ring/chan/1731400000/events.jsonl \
+    --control /spool/ring/chan/1731400000/control.json some_channel best
+```
+
+- The output goes to `DIR/chunk-000001.ts`, `chunk-000002.ts`, ... (`.mp4`
+  for fMP4/CMAF streams). DIR is created if missing and must not hold
+  `chunk-*` files already.
+- A chunk is closed at the first segment end after it holds
+  `--ring-chunk-s` seconds of media, so every chunk holds whole segments.
+- After each rotation the oldest chunks are deleted while the remaining ones
+  (including the one being written) still hold `--ring-keep-s` seconds.
+  Nothing is pruned while an output switch is in flight.
+- fMP4: every chunk starts with the current `EXT-X-MAP` init section, so each
+  chunk plays on its own and pruning never removes the init. The init bytes
+  are part of the chunk's first segment (as at the start of any recording);
+  `chunk.init_length` says how many there are, for a consumer that
+  concatenates chunks and wants to drop the repeated ones. MPEG-TS chunks
+  need nothing.
+- Offsets in events are *ring offsets*: positions in the virtual output made
+  of every chunk ever written, back to back. Chunk `N` is the byte range
+  `offset..offset+length`; a segment at ring offset `o` is at
+  `o - chunk.offset` in that chunk's file. Segment events of pruned chunks
+  stay in the events file; use `ring.base_offset` to skip them.
+- The ring never deletes chunks except by pruning: after a switch, on exit
+  or on a signal, the held chunks stay in DIR (the last one is reported
+  with `closed_by: "switch"` or `"end"`).
+
+### Output switch (`--control`)
+
+A supervisor can move a running recording to new files without signals and
+without a gap: at the next segment boundary the recorder closes the current
+output (the ring's open chunk, or a plain `--output`), continues in the new
+output and switches its events to a new events file. Switching works any
+number of times.
+
+Write the request as one JSON object to the control file, best by writing a
+temporary file next to it and renaming it over the path:
+
+```json
+{"id": "promote-42", "output": "/rec/part-0002.ts", "events": "/rec/part-0002.events.jsonl"}
+```
+
+- `id` (string, required): the request id. `output`, `events` (required):
+  new or empty files (as for `--output`; not `-`, not the current files).
+  Their directory must exist. `action` is optional and may only be
+  `"switch_output"`. Other fields are ignored.
+- The file is polled every 200 ms. Every new version of it (a new inode,
+  size or modification time) is read as a request. Content already there at
+  start-up counts too, so use a fresh control path per process (or remove the
+  file first).
+- On a new id the recorder writes `output_switch_requested` and opens both
+  files **on a thread of its own**: a slow or hung mount never stalls segment
+  fetching. Until they are open, recording goes on into the current output
+  (a ring keeps rotating but does not prune). If the open fails, or takes
+  longer than `--control-open-timeout`, an `output_switch_failed` event is
+  written and recording simply continues where it was; nothing is lost.
+- Once both files are open, at the next segment boundary:
+  1. a gap waiting to be reported at the boundary is written to the old
+     events file; a ring writes the `chunk` event of its open chunk
+     (`closed_by: "switch"`);
+  2. `output_switched` is written to the **old** events file (its last line;
+     no `end` follows there) and the old files are closed;
+  3. the new events file starts like a fresh recording: `start` (the run's
+     `start` with `output` = the new output, `output_offset: 0` and
+     `request_id`), then the same `output_switched` event;
+  4. the new output starts at offset 0; for fMP4 it starts with the current
+     init section (inside its first segment, as for any recording).
+  The segment after the boundary is the first one in the new output:
+  sequence numbers continue without a gap or a duplicate (a stream gap
+  that happens to fall at the boundary is still reported as a `gap`).
+- Idempotent: a request whose id was already handled is not executed again;
+  its acknowledgement (`output_switched` or `output_switch_failed`) is
+  written again to the current events file with `repeat: true`. A request
+  for an id that is still in flight is ignored. Requests that arrive while
+  another one is in flight are handled after it, in order. To retry a failed
+  switch, use a new id.
+- If the recording ends before a pending switch happens, the switch is
+  reported as `output_switch_failed` with `reason: "recording_ended"` (the
+  new files may already exist, empty).
+- After a switch the `end` totals and `segment` offsets describe the new
+  output only. A `segment_timing` correction for a prefetch segment written
+  just before the boundary is dropped (it would point into the old file).
 
 ### Exit codes
 
@@ -158,7 +253,10 @@ ads it may be dropped or replaced by a substitute segment.
   `low_latency`, `live_edge` (effective), `ad_block`, `persist_stream`,
   `recovery_timeout`, `segment_threads`, `segment_attempts`,
   `segment_timeout`, `stream_timeout`, `supported_codecs`, `output`,
-  `output_offset`, `stream_id`, `title`, `category`.
+  `output_offset`, `stream_id`, `title`, `category`. Only when set: `ring`
+  (`dir`, `keep_s`, `chunk_s`; `output` is then the ring directory),
+  `control` (the control file path), `request_id` (in a `start` written by
+  an output switch).
 - `segment`: one per segment written, **in output order**, emitted after its
   bytes were written and flushed. `offset` + `length` locate it in the
   output; consecutive segments are contiguous, so offsets plus lengths sum to
@@ -208,7 +306,37 @@ ads it may be dropped or replaced by a substitute segment.
   with `persist_stream`.
 - `warning` / `error`: `code` + `message` (`error.code` equals the `end`
   reason). Warning codes: `retry_open`, `recovery_timeout`, `pipeline`
-  (playlist reload failed).
+  (playlist reload failed), `control_invalid`.
+- `chunk` (ring mode): a chunk file was closed. `index`, `path`, `offset`
+  and `length` (ring offsets), `init_length` (fMP4 init bytes at its head,
+  else 0), `segments`, `duration` (sum of segment durations),
+  `first_slot_sequence`, `last_slot_sequence`, `first_program_date_time`,
+  `last_program_date_time`, `closed_by` (`rotate`, `switch` or `end`).
+  Written after the chunk's last `segment` event.
+- `ring` (ring mode): `action` `rotate` (after the `chunk` event; `closed` =
+  its index) or `prune` (`removed` = the deleted paths). Both describe what
+  is held now: `chunks` (indexes of the closed chunks on disk, oldest first),
+  `held_bytes` and `held_seconds` (including the chunk being written),
+  `base_offset` (ring offset of the oldest byte held),
+  `first_slot_sequence`.
+- `output_switch_requested`: a switch request was accepted and its files are
+  being opened: `request_id`, `output`, `events`.
+- `output_switched`: see [Output switch](#output-switch---control).
+  `request_id`, `repeat`, `last_slot_sequence` (last live slot seen before
+  the boundary, written or not), `last_sequence` (content sequence of the
+  last segment written to the old output), `next_slot_sequence` (=
+  `last_slot_sequence + 1`: where the new output starts unless a gap
+  follows), `program_date_time` (end date of the last segment written to the
+  old output: its PDT + duration), `init` (the new output starts with an
+  fMP4 init section), `from` {`output` (file or ring directory), `events`,
+  `end_offset` (offset just past its last byte; ring offset for a ring),
+  `segments`, `bytes`, `chunks` (ring only: the `chunk` objects left on disk,
+  oldest first), `error` (only if flushing the old output failed)}, `to`
+  {`output`, `events`, `offset` (always 0)}.
+- `output_switch_failed`: `request_id` (null if the control file had none),
+  `repeat`, `reason` (`invalid`, `open_failed`, `open_timeout`,
+  `recording_ended`), `message`, `output`, `events`. A control file that
+  cannot be parsed at all gives a `warning` with code `control_invalid`.
 - `end`: `reason`, `exit_code`, `signal` (`SIGTERM`/`SIGINT` or null),
   `error`, and totals: `segments`, `bytes`, `gaps`, `gap_segments`,
   `discontinuities`, `ad_substitute_segments`, `incomplete_segments`,
@@ -307,6 +435,12 @@ parsing (no new flags = player mode), config parsing, event
 ordering/offsets/gaps/kinds, and run the real worker + fetcher + recorder
 against a local HTTP server serving fixture playlists (including SIGTERM
 handling and a check that player mode's byte stream carries no markers).
+Ring and switch tests check that chunks tile the output and are pruned to
+`--ring-keep-s`, that sequence numbers run on without a gap or duplicate
+across several switches (out of a ring and between plain files), that every
+fMP4 chunk and switched output starts with exactly one init section, that a
+hung open (a FIFO) never stalls the recording, and that repeated request ids
+are only re-acknowledged.
 
 On Linux without a local toolchain, everything runs in the `rust:1` image:
 

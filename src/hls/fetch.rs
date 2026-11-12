@@ -159,16 +159,19 @@ impl SegmentFetcher {
                     response,
                     substitute,
                 } => {
-                    marker(SlotMarker::Begin(SlotInfo::new(
-                        &segment,
-                        substitute.as_ref(),
-                    )));
                     // a substitute comes from another playlist: its init (if
                     // any) is unknown, so the live map is left alone
                     let header = match (&segment.map_uri, &substitute) {
                         (Some(uri), None) => this.init_for(&mut init, uri).await,
                         _ => None,
                     };
+                    if let Some(header) = &header {
+                        marker(SlotMarker::Init(header.clone()));
+                    }
+                    marker(SlotMarker::Begin(SlotInfo::new(
+                        &segment,
+                        substitute.as_ref(),
+                    )));
                     if let Some(header) = header
                         && out.send(header).await.is_err()
                     {
@@ -238,7 +241,10 @@ impl SegmentFetcher {
             return None;
         }
         let fetched = match self.fetch_url(uri).await {
-            Ok(response) => response.bytes().await.context("init section download failed"),
+            Ok(response) => response
+                .bytes()
+                .await
+                .context("init section download failed"),
             Err(err) => Err(err),
         };
         let data = match fetched {

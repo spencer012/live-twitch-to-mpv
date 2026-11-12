@@ -6,6 +6,7 @@
 //! out-of-band [`PipelineEvent`]s. Without an `EventTx` (player mode) none of
 //! this is produced and the byte stream is identical.
 
+use bytes::Bytes;
 use chrono::{DateTime, FixedOffset};
 use tokio::sync::mpsc;
 
@@ -112,6 +113,11 @@ pub enum SlotMarker {
     Skipped(SlotInfo),
     /// The download failed after all attempts; nothing was written.
     Failed(SlotInfo, String),
+    /// The next slot (its `Begin` follows) starts with this fMP4 init
+    /// section (`EXT-X-MAP`): its bytes are the first data of that slot.
+    /// Sent only when the fetcher writes an init, so the recorder always
+    /// knows the current one (to put it at the head of a new output).
+    Init(Bytes),
 }
 
 /// Send an event if instrumentation is enabled.

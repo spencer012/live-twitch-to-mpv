@@ -61,6 +61,19 @@ pub struct Tracker {
     emitted_prefetch: VecDeque<EmittedPrefetch>,
     pub totals: Totals,
     attempt_segments: u64,
+    /// Segments written over all outputs (totals restart at a switch).
+    lifetime_segments: u64,
+    /// Sequence numbers and end date of the last segment written.
+    last_segment: Option<LastSegment>,
+}
+
+/// The last segment written: where the next output picks up.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LastSegment {
+    pub slot_sequence: i64,
+    pub sequence: Option<i64>,
+    /// Program date time + duration: the date at the segment's end.
+    pub end_program_date_time: Option<String>,
 }
 
 impl Tracker {
@@ -78,7 +91,53 @@ impl Tracker {
             emitted_prefetch: VecDeque::new(),
             totals: Totals::default(),
             attempt_segments: 0,
+            lifetime_segments: 0,
+            last_segment: None,
         }
+    }
+
+    /// A segment is being written (bytes may still arrive for it).
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// The last live playlist slot seen (written, skipped or failed).
+    pub fn last_slot(&self) -> Option<i64> {
+        self.last_slot
+    }
+
+    pub fn last_segment(&self) -> Option<&LastSegment> {
+        self.last_segment.as_ref()
+    }
+
+    /// Segments written over all outputs of this run.
+    pub fn lifetime_segments(&self) -> u64 {
+        self.lifetime_segments
+    }
+
+    /// Bytes written to the current output (plus its start offset).
+    pub fn output_offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Report a gap that is waiting for the next segment now (before the
+    /// output changes, so it lands in the output where it happened).
+    pub fn flush_pending_gap(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        self.flush_gap(&mut events);
+        events
+    }
+
+    /// The output was switched at a segment boundary: offsets restart at 0
+    /// and totals count the new output only. Sequence continuity (gaps,
+    /// discontinuities) carries over. Returns the old output's totals.
+    /// Late `segment_timing` corrections for prefetch segments written to the
+    /// old output are dropped (their offsets belong to the old file).
+    pub fn switch_output(&mut self) -> Totals {
+        debug_assert!(self.open.is_none() && self.pending_gap.is_none());
+        self.offset = 0;
+        self.emitted_prefetch.clear();
+        std::mem::take(&mut self.totals)
     }
 
     /// Current output offset (bytes written so far, including any start offset).
@@ -140,6 +199,8 @@ impl Tracker {
                 self.slot_seen(info.sequence, &mut events);
                 self.add_gap(&info, "download_failed", Some(error), &mut events);
             }
+            // the init's bytes arrive as data inside the next slot
+            SlotMarker::Init(_) => {}
         }
         events
     }
@@ -396,6 +457,17 @@ impl Tracker {
         let program_date_time = fmt_opt_time(date);
         self.totals.segments += 1;
         self.attempt_segments += 1;
+        self.lifetime_segments += 1;
+        self.last_segment =
+            Some(LastSegment {
+                slot_sequence: info.sequence,
+                sequence,
+                end_program_date_time: fmt_opt_time(date.map(|d| {
+                    d + chrono::Duration::milliseconds(
+                        (duration.unwrap_or(0.0) * 1000.0).round() as i64
+                    )
+                })),
+            });
         self.totals.bytes += open.len;
         self.totals.media_duration_s += duration.unwrap_or(0.0);
         if kind == "ad_substitute" {
@@ -529,6 +601,34 @@ mod tests {
         assert_eq!(t.offset(), 357);
         assert_eq!(t.totals.segments, 3);
         assert_eq!(t.totals.media_duration_s, 6.0);
+    }
+
+    #[test]
+    fn switch_output_restarts_offsets_and_keeps_continuity() {
+        let mut t = Tracker::new(0);
+        write(&mut t, slot(1), 10);
+        let mut ad = slot(2);
+        ad.ad = true;
+        t.on_marker(SlotMarker::Skipped(ad));
+        assert!(!t.is_open());
+        // the gap at the boundary goes to the old output, at its end
+        let gap = t.flush_pending_gap();
+        assert!(matches!(&gap[..], [Event::Gap(g)] if g.offset == 10 && g.from_sequence == 2));
+        let old = t.switch_output();
+        assert_eq!((old.segments, old.bytes, old.gaps), (1, 10, 1));
+        assert_eq!(t.last_slot(), Some(2));
+        let last = t.last_segment().unwrap();
+        assert_eq!(last.slot_sequence, 1);
+        assert_eq!(
+            last.end_program_date_time.as_deref(),
+            Some("2026-01-01T00:00:04.000Z")
+        );
+        let ev = write(&mut t, slot(3), 7);
+        // continuity is tracked across the switch: 1 -> 3 is a jump
+        assert!(matches!(&ev[0], Event::Discontinuity(d) if d.offset == 0));
+        assert_eq!(segments(&ev)[0].offset, 0);
+        assert_eq!(t.totals.segments, 1);
+        assert_eq!(t.lifetime_segments(), 2);
     }
 
     #[test]
